@@ -23,10 +23,7 @@ impl Plugin for CameraControllerPlugin {
     }
 }
 
-/// Based on Valorant's default sensitivity, not entirely sure why it is exactly 1.0 / 180.0,
-/// but I'm guessing it is a misunderstanding between degrees/radians and then sticking with
-/// it because it felt nice.
-pub const RADIANS_PER_DOT: f32 = 1.0 / 180.0;
+pub const RADIANS_PER_DOT: f32 = 0.00025; // feels good
 
 /// Camera controller [`Component`].
 #[derive(Component)]
@@ -61,6 +58,13 @@ impl Default for CameraController {
     }
 }
 
+impl CameraController {
+    pub fn with_sensitivity(mut self: Self, sensitivity: f32) -> Self {
+        self.sensitivity = sensitivity;
+        self
+    }
+}
+
 impl fmt::Display for CameraController {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -76,33 +80,35 @@ Freecam Controls:
 }
 
 // limit pitch to 10 degrees away from y-axis
-pub const MAX_PITCH: f32 = PI / 2.0 - 10.0 / 180.0 * PI;
+pub const MAX_PITCH: f32 = PI / 2.0 - 5.0 / 180.0 * PI;
 
-fn run_camera_controller(
+pub fn run_camera_controller(
+    time: Res<Time>,
     mut windows: Query<(&Window, &mut CursorOptions)>,
     accumulated_mouse_motion: Res<AccumulatedMouseMotion>,
     mouse_button_input: Res<ButtonInput<MouseButton>>,
     key_input: Res<ButtonInput<KeyCode>>,
     mut toggle_cursor_grab: Local<bool>,
     mut mouse_cursor_grab: Local<bool>,
-    mut query: Query<(&mut Transform, &mut CameraController), With<Camera3d>>,
+    query: Single<(&mut Transform, &mut CameraController), With<Camera3d>>,
 ) {
-    let Ok((mut transform, mut controller)) = query.single_mut() else {
-        return;
-    };
+    let (mut transform, mut controller) = query.into_inner();
 
     if !controller.initialized {
         let (yaw, pitch, _roll) = transform.rotation.to_euler(EulerRot::YXZ);
         controller.yaw = yaw;
-        controller.pitch = pitch;
+        controller.pitch = pitch.clamp(-MAX_PITCH, MAX_PITCH);
         controller.initialized = true;
         info!("{}", *controller);
     }
+
     if !controller.enabled {
         return;
     }
 
+    // === Cursor grab handling ===
     let mut cursor_grab_change = false;
+
     if key_input.just_pressed(controller.keyboard_key_toggle_cursor_grab) {
         *toggle_cursor_grab = !*toggle_cursor_grab;
         cursor_grab_change = true;
@@ -115,35 +121,53 @@ fn run_camera_controller(
         *mouse_cursor_grab = false;
         cursor_grab_change = true;
     }
-    let cursor_grab = *mouse_cursor_grab || *toggle_cursor_grab;
 
-    // Handle cursor grab
+    let cursor_grabbed = *toggle_cursor_grab || *mouse_cursor_grab;
+
     if cursor_grab_change {
-        if cursor_grab {
-            for (window, mut cursor_options) in &mut windows {
-                if !window.focused {
-                    continue;
-                }
-
+        for (window, mut cursor_options) in windows.iter_mut() {
+            if !window.focused {
+                continue;
+            }
+            if cursor_grabbed {
                 cursor_options.grab_mode = CursorGrabMode::Locked;
                 cursor_options.visible = false;
-            }
-        } else {
-            for (_, mut cursor_options) in &mut windows {
+            } else {
                 cursor_options.grab_mode = CursorGrabMode::None;
                 cursor_options.visible = true;
             }
         }
     }
 
-    // Handle mouse input
-    if accumulated_mouse_motion.delta != Vec2::ZERO && cursor_grab {
-        // Apply look update
-        controller.pitch = (controller.pitch
-            - accumulated_mouse_motion.delta.y * RADIANS_PER_DOT * controller.sensitivity)
-            .clamp(-MAX_PITCH, MAX_PITCH);
-        controller.yaw -=
-            accumulated_mouse_motion.delta.x * RADIANS_PER_DOT * controller.sensitivity;
-        transform.rotation = Quat::from_euler(EulerRot::ZYX, 0.0, controller.yaw, controller.pitch);
+    let delta_secs = time.delta_secs();
+
+    if !cursor_grabbed {
+        // Smooth interpolation
+        let t = 1.0 - (-32.0 * delta_secs).exp();
+        transform.rotation = transform.rotation.slerp(
+            Quat::from_euler(EulerRot::YXZ, controller.yaw, controller.pitch, 0.0),
+            t,
+        );
+        return;
     }
+
+    let delta = accumulated_mouse_motion.delta;
+
+    if delta != Vec2::ZERO {
+        let sensitivity = controller.sensitivity * RADIANS_PER_DOT;
+
+        // Apply clamped deltas directly (small per-frame, no wrap issues)
+        let pitch_delta = delta.y * sensitivity;
+        let yaw_delta = delta.x * sensitivity;
+
+        controller.pitch = (controller.pitch - pitch_delta).clamp(-MAX_PITCH, MAX_PITCH);
+        controller.yaw = controller.yaw - yaw_delta;
+    }
+
+    // Smooth interpolation
+    let t = 1.0 - (-32.0 * delta_secs).exp();
+    transform.rotation = transform.rotation.slerp(
+        Quat::from_euler(EulerRot::YXZ, controller.yaw, controller.pitch, 0.0),
+        t,
+    );
 }
