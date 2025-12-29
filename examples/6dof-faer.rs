@@ -734,7 +734,7 @@ fn main() {
             CameraControllerPlugin,
         ))
         .insert_resource(PhysicsWorld::new())
-        .add_systems(Startup, (print_faer_info, setup_tshape, setup))
+        .add_systems(Startup, (print_faer_info, setup_wall_with_ceiling, setup))
         .add_systems(FixedUpdate, solve_system)
         .add_systems(Update, (render, input_force, camera_movement))
         .insert_resource(Time::<Fixed>::from_seconds(DT as f64))
@@ -819,7 +819,41 @@ fn setup_sqare_tower(mut sim: ResMut<PhysicsWorld>) {
 
 /// This example should test rotational stiffness of supporting connections
 #[allow(dead_code)]
-fn setup_wall_with_ceiling(mut sim: ResMut<PhysicsWorld>) {}
+fn setup_wall_with_ceiling(mut sim: ResMut<PhysicsWorld>) {
+    let w = SKYSCRAPER_WIDTH_NODES;
+    let d = SKYSCRAPER_DEPTH_NODES;
+
+    let s = 4.0;
+
+    let mut grid = vec![vec![vec![0; 2]; w]; d];
+
+    // create wall
+    for j in 0..d {
+        let pos = vec3(-(w as f32) / 2.0 * s, 0.0, (j as f32 - d as f32 / 2.0) * s);
+        let idx = sim.add_node(true, pos, Vec3::ZERO, Quat::IDENTITY, Vec3::ZERO);
+        grid[0][0][j] = idx;
+    }
+
+    // create ceiling
+    for i in 0..w {
+        for j in 0..d {
+            let pos = vec3(
+                (i as f32 - w as f32 / 2.0) * s,
+                1.0 * s,
+                (j as f32 - d as f32 / 2.0) * s,
+            );
+            let idx = sim.add_node(true, pos, Vec3::ZERO, Quat::IDENTITY, Vec3::ZERO);
+            grid[1][i][j] = idx;
+        }
+    }
+
+    // connect walls
+    for j in 0..d - 1 {
+        sim.add_conn(grid[0][0][j], grid[0][0][j + 1]);
+    }
+
+    sim.create_island();
+}
 
 #[allow(dead_code)]
 fn setup_tshape(mut sim: ResMut<PhysicsWorld>) {
