@@ -1,29 +1,62 @@
+//! The app in this file demoes some destruction capabilities of physics scenes.
+
 use std::{fmt::Display, time::Duration};
 
-use avian3d::{math::PI, prelude::*};
-use bevy::{
-    math::Vec3,
-    mesh::VertexAttributeValues,
+use avian_rerecast::AvianBackendPlugin;
+use avian3d::{
+    math::{FRAC_PI_2, PI},
     prelude::*,
+};
+use bevy::{
+    asset::RenderAssetUsages,
+    audio::Volume,
+    camera::primitives::Aabb,
+    color::palettes,
+    input::common_conditions::input_just_pressed,
+    math::Vec3,
+    mesh::{Indices, PrimitiveTopology},
+    platform::collections::HashMap,
+    prelude::*,
+    scene::SceneInstance,
     window::{CursorGrabMode, CursorOptions},
 };
+use vleue_navigator::prelude::*;
+
+use bevy::remote::{RemotePlugin, http::RemoteHttpPlugin};
+use bevy_inspector_egui::{bevy_egui::EguiPlugin, quick::WorldInspectorPlugin};
+use bevy_rerecast::{debug::DetailNavmeshGizmo, prelude::*, rerecast::DetailNavmesh};
 
 mod camera_controller;
 use camera_controller::*;
 
+mod sourcelike_kinematic_controller;
+use sourcelike_kinematic_controller::*;
+
+/// NavmeshUpdaterPlugin obstacle (add to collider to be used by plugin in navmesh construction)
+//#[derive(Component)]
+//struct Obstacle;
+
 fn main() {
     App::new()
-        // TUNE THE SOLVER
-        // Substeps help with fast motion/tunneling.
+        // ====== RESOURCES ======
         .insert_resource(SubstepCount(12))
         .insert_resource(TimeToSleep(0.2))
         .insert_resource(Gravity(Vec3::new(0.0, -9.81, 0.0)))
+        // ====== MESSAGES ======
+        .add_message::<NavmeshRegeneration>()
+        // ====== PLUGINS ======
         .add_plugins((
             DefaultPlugins,
             PhysicsPlugins::default(),
             PhysicsDebugPlugin::default(),
-            CameraControllerPlugin,
+            SourceControllerPlugin,
+            VleueNavigatorPlugin,
         ))
+        .add_plugins((RemotePlugin::default(), RemoteHttpPlugin::default()))
+        .add_plugins((NavmeshPlugins::default(), AvianBackendPlugin::default()))
+        .add_plugins(EguiPlugin::default())
+        .add_plugins(WorldInspectorPlugin::new())
+        .add_plugins(CameraControllerPlugin)
         .insert_gizmo_config(
             PhysicsGizmos {
                 raycast_color: Some(Color::NONE),
@@ -31,54 +64,115 @@ fn main() {
             },
             GizmoConfig::default(),
         )
-        .add_systems(Startup, setup_scene)
+        // ====== SYSTEMS ======
+        .add_systems(
+            Startup,
+            (load_sounds, load_placeables, setup_scene, generate_navmesh).chain(),
+        )
+        .add_systems(Update, player_input.after(run_camera_controller))
         .add_systems(
             Update,
             (
-                move_camera,
                 reset_camera_rayhit_data,
-                shoot_ray_from_camera_draw_intersection,
-                modify_display_wall,
-                position_and_draw_display_wall,
-                place_display_wall,
+                shoot_ray_from_camera,
+                modify_display_object,
+                position_and_draw_display_object,
+                place_display_object,
+                add_colliders_to_new_scenes,
+                print_added_pursuit_tag,
             )
                 .chain(),
         )
-        .add_systems(Update, (push_last_floor, handle_ball_despawning).chain())
+        .add_systems(Update, (shoot_ball, handle_ball_despawning).chain())
+        .add_systems(
+            Update,
+            (
+                find_path.run_if(input_just_pressed(KeyCode::KeyN)),
+                display_navigator_path,
+            ),
+        )
+        .add_systems(
+            PostUpdate,
+            (remove_destroyed_entities, regenerate_navmesh).chain(),
+        )
+        // ====== OBSERVERS ======
+        .add_observer(on_navmesh_ready)
+        // =======================
         .run();
 }
 
-#[derive(Component)]
-struct LastTowerFloor;
+// ===============================================
+// ========== COMPONENTS and RESOURCES  ==========
+// ===============================================
+
+/// Collision layers for the game
+#[derive(PhysicsLayer, Default)]
+enum GameLayer {
+    #[default]
+    Default,
+    Player,
+    Ball,
+}
+
+/// Stores all game sounds.
+/// Storing them all at once shouldn't be a huge problem:
+/// 1s of ogg file is around 20 Kb, so an hour is around 72 Mb, which is fine to store in RAM.
+#[derive(Resource)]
+struct GameSounds {
+    metal_ball_concrete_collision: Handle<AudioSource>,
+    concrete_crumbling: Handle<AudioSource>,
+    steampunk_weapon_shot: Handle<AudioSource>,
+}
 
 #[derive(Component)]
-struct FirstTowerFloor;
+struct CameraRayHitData(Option<RayHitData>);
+
+/// Component that destructible objects have and it holds usefull values for such objects
+/// NOTE: if more destruction scenarios arrise, it makes sense to use enum here instead of struct.
+#[derive(Component, Clone, Copy)]
+struct DestructibleParams {
+    /// Max impulse a destructible object can withstand
+    impulse_resistance: f32,
+}
+
+impl DestructibleParams {
+    pub fn new(impulse_resistance: f32) -> Self {
+        Self { impulse_resistance }
+    }
+}
+
+/// Marks destroyed object. See [DestructibleParams] for specifying destruction conditions.
+#[derive(Component)]
+struct DestroyedObject;
 
 /// Marks placeable walls
 #[derive(Component)]
 struct Wall;
 
-/// Marks placeable wall visual reference for placing
+/// Marks placeable element's visual reference for placing
 #[derive(Component)]
-struct DisplayWall;
+struct PlaceableDisplay;
 
 /// Marks placeable wall UI element
 #[derive(Component)]
 struct DisplayWallUI;
 
+#[derive(Component)]
+struct PlacementModeUI;
+
 #[derive(Component, Clone, Copy)]
 enum PlacementMode {
+    Static,
     Grounding,
-    Connecting,
     Destroying,
 }
 
 impl PlacementMode {
     pub fn cycle_mode(&mut self) {
         *self = match self {
-            PlacementMode::Grounding => PlacementMode::Connecting,
-            PlacementMode::Connecting => PlacementMode::Destroying,
-            PlacementMode::Destroying => PlacementMode::Grounding,
+            PlacementMode::Static => PlacementMode::Grounding,
+            PlacementMode::Grounding => PlacementMode::Destroying,
+            PlacementMode::Destroying => PlacementMode::Static,
         }
     }
 }
@@ -86,9 +180,9 @@ impl PlacementMode {
 impl Display for PlacementMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mode_str = match self {
-            PlacementMode::Grounding => "Grounding walls",
-            PlacementMode::Connecting => "Connecting walls",
-            PlacementMode::Destroying => "Destroying walls",
+            PlacementMode::Static => "Placing static object",
+            PlacementMode::Grounding => "Grounding object",
+            PlacementMode::Destroying => "Destroying object",
         };
         write!(f, "{mode_str}")
     }
@@ -97,101 +191,340 @@ impl Display for PlacementMode {
 #[derive(Component)]
 struct AdditionalRotation(Quat);
 
-#[derive(PhysicsLayer, Default)]
-enum GameLayer {
-    #[default]
-    Default,
+/// Marks projectiles
+#[derive(Component)]
+struct Projectile;
+
+#[derive(Component)]
+struct DestructionTimer(Timer);
+
+/// Marks ball projectile
+#[derive(Component)]
+struct Ball;
+
+/// Enum with all entities
+#[derive(Component, Clone, Copy)]
+enum PursuitProperty {
     Wall,
-    Ball,
+    Target,
+    Mob,
+}
+
+impl PursuitProperty {
+    fn add_appropriate_tag_to_entity(&self, mut commands: Commands, entity: Entity) {
+        let mut entity_commands = commands.entity(entity);
+        match self {
+            PursuitProperty::Wall => {
+                entity_commands.insert(Wall);
+            }
+            PursuitProperty::Target => {
+                entity_commands.insert(Target);
+            }
+            PursuitProperty::Mob => {
+                entity_commands.insert(Mob);
+            }
+        }
+    }
+
+    fn cycle_mode(&mut self) {
+        *self = match self {
+            PursuitProperty::Wall => PursuitProperty::Target,
+            PursuitProperty::Target => PursuitProperty::Mob,
+            PursuitProperty::Mob => PursuitProperty::Wall,
+        }
+    }
+}
+
+impl Display for PursuitProperty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let property_str = match self {
+            PursuitProperty::Wall => "PursuitProperty::Wall",
+            PursuitProperty::Target => "PursuitProperty::Target",
+            PursuitProperty::Mob => "PursuitProperty::Mob",
+        };
+        write!(f, "{property_str}")
+    }
+}
+
+#[derive(Component)]
+#[relationship(relationship_target = FollowedBy)]
+struct Following(Entity);
+
+#[derive(Component)]
+#[relationship_target(relationship = Following, linked_spawn)]
+struct FollowedBy(Vec<Entity>);
+
+#[derive(Component)]
+struct Navigator;
+
+/// Target that mobs persue
+#[derive(Component)]
+struct Target;
+
+#[derive(Component)]
+struct Mob;
+
+#[derive(Component)]
+struct NavPath {
+    current: Vec3,
+    next: Vec<Vec3>,
+}
+
+type PlaceableObjectType = Handle<Scene>;
+
+/// Objects that can be placed
+#[derive(Resource)]
+struct PlaceableObjects {
+    wall: PlaceableObjectType,
+    target: PlaceableObjectType,
+    mob: PlaceableObjectType,
+}
+
+#[derive(Component)]
+struct SelectedPlaceableObject(PlaceableObjectType);
+
+// =============================
+// ========== SYSTEMS ==========
+// =============================
+
+fn load_placeables(mut commands: Commands, asset_server: Res<AssetServer>) {
+    commands.insert_resource(PlaceableObjects {
+        wall: asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/Primitives/Cube.glb")),
+        target: asset_server
+            .load(GltfAssetLabel::Scene(0).from_asset("models/Primitives/Cylinder.glb")),
+        mob: asset_server
+            .load(GltfAssetLabel::Scene(0).from_asset("models/Primitives/Icosphere.glb")),
+    });
+}
+
+fn load_sounds(mut commands: Commands, asset_server: Res<AssetServer>) {
+    commands.insert_resource(GameSounds {
+        metal_ball_concrete_collision: asset_server
+            .load("sounds/StoneImpact/Bluezone_BC0297_stone_impact_015.ogg"),
+        concrete_crumbling: asset_server
+            .load("sounds/StoneImpact/Bluezone_BC0297_stone_impact_041.ogg"),
+        steampunk_weapon_shot: asset_server.load("sounds/BluezoneCorp - Steampunk Weapon And Textures/Bluezone_BC0296_steampunk_weapon_gun_shot_026_02.ogg"),
+    });
+}
+
+fn detail_navmesh_to_bevy_mesh(dmesh: &DetailNavmesh) -> Mesh {
+    let mut indices = Vec::new();
+    let mut vertices = Vec::new();
+    let mut vertex_map = HashMap::new();
+
+    for mesh in &dmesh.meshes {
+        let verts =
+            &dmesh.vertices[mesh.base_vertex_index as usize..][..mesh.vertex_count as usize];
+        let tris =
+            &dmesh.triangles[mesh.base_triangle_index as usize..][..mesh.triangle_count as usize];
+
+        for tri in tris {
+            for i in 0..3 {
+                let p = verts[tri[i] as usize];
+                // Weld vertices by position to ensure connectivity
+                let key = [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
+                let index = *vertex_map.entry(key).or_insert_with(|| {
+                    vertices.push(p);
+                    (vertices.len() - 1) as u32
+                });
+                indices.push(index);
+            }
+        }
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
+    .with_inserted_indices(Indices::U32(indices))
+    .with_computed_normals()
+}
+
+#[derive(Resource)]
+struct NavmeshHandle(Handle<Navmesh>);
+
+const AGENT_RADIUS: f32 = 0.3;
+const AGENT_HEIGHT: f32 = 0.6;
+
+fn get_navmesh_settings() -> NavmeshSettings {
+    let mut settings = NavmeshSettings::from_agent_3d(AGENT_RADIUS, AGENT_HEIGHT);
+    settings.walkable_slope_angle = 65.0_f32.to_radians();
+    settings.walkable_climb = 0.5;
+    settings
+}
+
+fn generate_navmesh(mut commands: Commands, mut generator: NavmeshGenerator) {
+    let navmesh_handle = generator.generate(get_navmesh_settings());
+    // Save navmesh handle so it doesn't get dropped
+    commands.spawn(DetailNavmeshGizmo::new(&navmesh_handle));
+    commands.insert_resource(NavmeshHandle(navmesh_handle));
+}
+
+#[derive(Message)]
+struct NavmeshRegeneration;
+
+fn regenerate_navmesh(
+    mut message_reader: MessageReader<NavmeshRegeneration>,
+    mut generator: NavmeshGenerator,
+    navmesh_handle_res: Res<NavmeshHandle>,
+) {
+    if !message_reader.is_empty() {
+        message_reader.clear();
+
+        if generator.regenerate(&navmesh_handle_res.0, get_navmesh_settings()) {
+            info!("Regeneration queued successfully.");
+        } else {
+            warn!("Regeneration queuing failed. Already queued.");
+        }
+    }
+}
+
+#[derive(Resource)]
+pub struct NavMeshHandle(Handle<NavMesh>);
+
+#[derive(Component)]
+struct NavMeshRepr;
+
+fn on_navmesh_ready(
+    trigger: On<NavmeshReady>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    navmeshes: Res<Assets<Navmesh>>,
+    mut vleue_navmeshes: ResMut<Assets<NavMesh>>,
+    // Query returns Option<Single<...>> to handle 0 or 1 entity safely
+    vleue_navmesh_repr_q: Option<Single<Entity, With<NavMeshRepr>>>,
+) {
+    let asset_id = trigger.event().0;
+
+    if let Some(navmesh) = navmeshes.get(asset_id) {
+        let dmesh = &navmesh.detail;
+
+        let mesh = detail_navmesh_to_bevy_mesh(&dmesh);
+
+        if let Some(vleue_navmesh) = NavMesh::from_bevy_mesh(&mesh) {
+            let vleue_mesh_repr = vleue_navmesh.to_mesh().with_computed_normals();
+
+            // 2. Debug Check: Ensure the converted visual mesh is valid
+            let v_count = vleue_mesh_repr.count_vertices();
+            info!("Regenerated NavMesh visual with {} vertices.", v_count);
+
+            let new_mesh_repr = Mesh3d(meshes.add(vleue_mesh_repr));
+
+            if let Some(vleue_navmesh_repr) = vleue_navmesh_repr_q {
+                let vleue_navmesh_entity = vleue_navmesh_repr.into_inner();
+
+                // CRITICAL FIX: Remove Aabb to force recalculation of culling bounds
+                commands
+                    .entity(vleue_navmesh_entity)
+                    .insert(new_mesh_repr)
+                    .remove::<Aabb>();
+            } else {
+                // Initial spawn
+                commands.spawn((
+                    NavMeshRepr,
+                    new_mesh_repr,
+                    MeshMaterial3d(materials.add(StandardMaterial::from_color(Color::Srgba(
+                        Srgba {
+                            red: 0.8,
+                            green: 0.1,
+                            blue: 0.1,
+                            alpha: 0.5,
+                        },
+                    )))),
+                    Transform::from_xyz(0.0, 1.0, 0.0),
+                ));
+            }
+
+            let vleue_navmesh_handle = vleue_navmeshes.add(vleue_navmesh);
+            commands.insert_resource(NavMeshHandle(vleue_navmesh_handle));
+            info!("Navmesh converted and resource inserted!");
+        } else {
+            warn!("Failed to convert bevy_rerecast mesh to vleue_navigator mesh.");
+        }
+    }
+}
+
+fn find_path(
+    mut commands: Commands,
+    navmeshes: Res<Assets<NavMesh>>,
+    navmesh: Res<NavMeshHandle>,
+    navigator_s: Single<(Entity, &Transform, &Following), With<Navigator>>,
+    transform_q: Query<&Transform>,
+) {
+    if let Some(navmesh) = navmeshes.get(&navmesh.0) {
+        let (entity, transform, following) = navigator_s.into_inner();
+
+        let Ok(following_transform) = transform_q.get(following.0) else {
+            return;
+        };
+
+        info!("target transform: {}", following_transform.translation);
+
+        if let Some(path) =
+            navmesh.transformed_path(transform.translation, following_transform.translation)
+        {
+            if let Some((first, remaining)) = path.path.split_first() {
+                let mut remaining = remaining.to_vec();
+                remaining.reverse();
+                commands.entity(entity).insert(NavPath {
+                    current: *first,
+                    next: remaining.clone(),
+                });
+                info!(
+                    "found path from {:?} to {:?}: {:?}",
+                    first,
+                    remaining.first(),
+                    path
+                );
+            }
+        } else {
+            info!(
+                "no path found from {:?} to {:?}",
+                transform.translation, following_transform.translation
+            );
+        }
+    }
+}
+
+fn display_navigator_path(navigator: Query<(&Transform, &NavPath)>, mut gizmos: Gizmos) {
+    for (transform, path) in &navigator {
+        let mut to_display = path.next.clone();
+        to_display.push(path.current);
+        to_display.push(transform.translation);
+        to_display.reverse();
+        if !to_display.is_empty() {
+            gizmos.linestrip(
+                to_display.iter().map(|xz| Vec3::new(xz.x, xz.y, xz.z)),
+                Color::Srgba(palettes::tailwind::AMBER_400),
+            );
+        }
+    }
 }
 
 fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    asset_server: Res<AssetServer>,
+    placeable_objects: Res<PlaceableObjects>,
 ) {
     let gray_mat = materials.add(Color::srgb(0.3, 0.3, 0.3));
 
     // THE ANCHOR (Ground)
-    let ground_entity = commands
-        .spawn((
-            Name::new("Ground"),
-            RigidBody::Static,
-            Collider::cuboid(50.0, 1.0, 50.0),
-            Mesh3d(meshes.add(Cuboid::new(50.0, 1.0, 50.0))),
-            MeshMaterial3d(gray_mat.clone()),
-            Transform::from_xyz(0.0, -0.5, 0.0),
-        ))
-        .id();
+    commands.spawn((
+        Name::new("Ground"),
+        RigidBody::Static,
+        Collider::cuboid(90.0, 1.0, 90.0),
+        Mesh3d(meshes.add(Cuboid::new(90.0, 1.0, 90.0))),
+        MeshMaterial3d(gray_mat.clone()),
+        Transform::from_xyz(0.0, -0.5, 0.0),
+    ));
 
-    // CONFIGURATION
-    let story_height = 3.0;
     let floor_size = 4.0;
-    let floor_rot_ang_rad = PI / 12.0;
-
-    let joint_offset = Vec3::ZERO;
-
-    let floor_mesh = meshes.add(Cuboid::new(floor_size, 0.5, floor_size)); // Thicker slabs look better
+    let floor_mesh = meshes.add(Cuboid::new(floor_size, 0.5, floor_size));
     let blue_mat = materials.add(Color::srgb(0.2, 0.2, 0.8));
-
-    let mut prev_floor_entity = ground_entity;
-
-    for i in 0..50 {
-        let y_pos = (i as f32 * story_height) + 1.0;
-
-        let curr_floor_global_rot_y = floor_rot_ang_rad * i as f32;
-        let floor_entity = commands
-            .spawn((
-                Wall,
-                RigidBody::Dynamic,
-                Collider::cuboid(floor_size, 0.5, floor_size),
-                Mesh3d(floor_mesh.clone()),
-                MeshMaterial3d(blue_mat.clone()),
-                Transform::from_xyz(0.0, y_pos, 0.0)
-                    .with_rotation(Quat::from_rotation_y(curr_floor_global_rot_y)),
-                Mass(1000.0),
-                AngularInertia {
-                    principal: Vec3::splat(1e8f32),
-                    local_frame: Quat::IDENTITY,
-                },
-                LinearDamping(5.0),
-                AngularDamping(5.0),
-                SleepThreshold {
-                    linear: 0.8,
-                    angular: 0.8,
-                },
-            ))
-            .id();
-
-        let anchor_prev = if i == 0 {
-            // Ground case: Anchor is on the top surface of the ground
-            Vec3::new(joint_offset.x, 0.5, joint_offset.z)
-        } else {
-            Vec3::new(joint_offset.x, story_height / 2.0, joint_offset.z)
-        };
-
-        let anchor_curr = Vec3::new(joint_offset.x, -story_height / 2.0, joint_offset.z);
-
-        let curr_joint_rot_y = if i == 0 {
-            Quat::IDENTITY
-        } else {
-            Quat::from_rotation_y(floor_rot_ang_rad)
-        };
-
-        commands.spawn(
-            FixedJoint::new(prev_floor_entity, floor_entity)
-                .with_local_anchor1(anchor_prev)
-                .with_local_anchor2(anchor_curr)
-                .with_basis(curr_joint_rot_y),
-        );
-
-        prev_floor_entity = floor_entity;
-        if i == 0 {
-            commands.entity(floor_entity).insert(FirstTowerFloor);
-        }
-    }
-
-    commands.entity(prev_floor_entity).insert(LastTowerFloor);
 
     commands.spawn((
         Wall,
@@ -200,28 +533,23 @@ fn setup_scene(
         ColliderDensity(8.0),
         Mesh3d(floor_mesh.clone()),
         MeshMaterial3d(blue_mat.clone()),
-        Transform::from_xyz(5.0, 5.0, -5.0).with_rotation(Quat::from_rotation_z(PI / 6.0)),
-        //AngularInertia {
-        //    principal: Vec3::splat(50_000.0),
-        //    local_frame: Quat::IDENTITY,
-        //},
-        //LinearDamping(5.0),
-        //AngularDamping(5.0),
-        SleepThreshold {
-            linear: 0.8,
-            angular: 0.8,
-        },
+        Transform::from_xyz(5.0, 2.5, -5.0).with_rotation(Quat::from_rotation_z(PI / 2.0)),
+        // Add audio player to the block
+        AudioPlayer::new(asset_server.load("sounds/Windless Slopes.ogg")),
+        PlaybackSettings::LOOP.with_spatial(true),
     ));
 
     // Display wall for visualizing placement
-    let placement_mode = PlacementMode::Grounding;
+    let placement_mode = PlacementMode::Static;
+    let pursuit_property = PursuitProperty::Wall;
     commands.spawn((
-        DisplayWall,
+        PlaceableDisplay,
         placement_mode,
-        Mesh3d(meshes.add(Cuboid::new(0.5, 4.0, 2.0))),
-        MeshMaterial3d(materials.add(Color::srgba(0.2, 0.2, 0.8, 0.7))),
+        pursuit_property,
+        SelectedPlaceableObject(placeable_objects.wall.clone()),
+        SceneRoot(placeable_objects.wall.clone()),
         // Add rigid body and collider, but disable them
-        RigidBodyComponents(RigidBody::Dynamic, Collider::cuboid(0.5, 4.0, 2.0)),
+        RigidBody::Static,
         RigidBodyDisabled,
         ColliderDisabled,
         Transform::from_xyz(0.0, 0.0, 0.0),
@@ -244,19 +572,59 @@ fn setup_scene(
         },
     ));
 
-    // Create camera entity
     commands.spawn((
-        Camera3d::default(),
-        CameraController::default().with_sensitivity(8.0),
-        Transform::from_xyz(15.0, 5.0, 25.0),
-        RayCaster::new(Vec3::ZERO, Dir3::NEG_Z)
-            .with_solidness(false)
-            .with_max_hits(1)
-            .with_max_distance(300.0)
-            .with_query_filter(SpatialQueryFilter::from_mask([GameLayer::Default])),
-        CameraRayHitData(None),
-        MovementSpeed(20.0),
+        PlacementModeUI,
+        Text::new(format!(
+            "Press C to switch pursuit mode: {pursuit_property}"
+        )),
+        TextLayout::new_with_justify(Justify::Center),
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(20.0),
+            top: Val::Px(40.0),
+            ..Default::default()
+        },
     ));
+
+    // Create camera entity
+    let player_entity = commands
+        .spawn((
+            Name::new("Player"),
+            Transform::from_xyz(15.0, 2.0, 25.0),
+            (
+                RigidBody::Kinematic,
+                LockedAxes::ROTATION_LOCKED,
+                Collider::capsule(0.4, 1.0),
+                ColliderDensity(5.0),
+                CollisionLayers::new([GameLayer::Player], [GameLayer::Default]),
+                CollisionEventsEnabled,
+                // Debug rendering interferes with camera view
+                DebugRender::none(),
+            ),
+            // Controller bundle
+            (
+                SourceController::default(),
+                CharacterInput::default(),
+                CharacterState::default(),
+            ),
+            // Audio listener
+            SpatialListener::new(0.2),
+        ))
+        .with_child((
+            Camera3d::default(),
+            CameraController::default(),
+            Transform::from_xyz(0.0, 0.0, 0.0),
+            (
+                RayCaster::new(Vec3::ZERO, Dir3::NEG_Z)
+                    .with_solidness(false)
+                    .with_max_hits(1)
+                    .with_max_distance(300.0)
+                    .with_query_filter(SpatialQueryFilter::from_mask([GameLayer::Default])),
+                CameraRayHitData(None),
+            ),
+        ))
+        .observe(player_collision_mark_destroyed_entities)
+        .id();
 
     commands.spawn((
         DirectionalLight {
@@ -266,54 +634,85 @@ fn setup_scene(
         },
         Transform::from_rotation(Quat::from_rotation_x(-0.5)),
     ));
+
+    // Add navmesh
+    commands.spawn((
+        NavMeshSettings {
+            fixed: Triangulation::from_outer_edges(&[
+                vec2(-100.0, -100.0),
+                vec2(100.0, -100.0),
+                vec2(100.0, 100.0),
+                vec2(-100.0, 100.0),
+            ]),
+            simplify: 0.005,
+            merge_steps: 0,
+            upward_shift: 1.0,
+            build_timeout: Some(1.0),
+            ..Default::default()
+        },
+        NavMeshUpdateMode::Direct,
+        Transform::from_xyz(0.0, 0.1, 0.0).with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+        NavMeshDebug(palettes::tailwind::RED_600.into()),
+    ));
+
+    // Add navigator
+    commands.spawn((
+        Navigator,
+        Following(player_entity),
+        Mesh3d(meshes.add(Capsule3d::new(0.3, 1.0))),
+        MeshMaterial3d(blue_mat.clone()),
+        Transform::from_xyz(-30.0, 0.0, -30.0),
+    ));
 }
 
-#[derive(Component)]
-struct RigidBodyComponents(RigidBody, Collider);
-
-#[derive(Component)]
-struct MovementSpeed(f32);
-
-fn move_camera(
-    time: Res<Time>,
-    mut camera_query: Single<(&mut Transform, &MovementSpeed), With<CameraController>>,
-    key_inputs: Res<ButtonInput<KeyCode>>,
+pub fn player_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    character_controller_q: Single<&mut CharacterInput, With<SourceController>>,
+    camera_controller_q: Single<&Transform, With<CameraController>>,
 ) {
-    let delta_secs = time.delta_secs();
+    let mut input = character_controller_q.into_inner();
+    let camera_transform = camera_controller_q.into_inner();
 
-    // if shift is pressed increase speed
-    let speed_up = if key_inputs.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
-        3.0
-    } else {
-        1.0
-    };
+    // 1. Get Forward/Right vectors from the Transform
+    // Note: transform.forward() returns a Dir3, we convert to Vec3
+    let raw_forward = camera_transform.forward().as_vec3();
+    let raw_right = camera_transform.right().as_vec3();
 
-    let mut dir = Vec2::new(
-        key_inputs.pressed(KeyCode::KeyD) as u32 as f32
-            - key_inputs.pressed(KeyCode::KeyA) as u32 as f32,
-        key_inputs.pressed(KeyCode::KeyW) as u32 as f32
-            - key_inputs.pressed(KeyCode::KeyS) as u32 as f32,
-    );
+    // 2. Flatten them to the XZ plane (Ground)
+    // This ensures that looking Up/Down doesn't affect movement speed or direction
+    let flat_forward = (raw_forward * Vec3::new(1.0, 0.0, 1.0)).normalize_or_zero();
+    let flat_right = (raw_right * Vec3::new(1.0, 0.0, 1.0)).normalize_or_zero();
 
-    dir = dir.normalize_or_zero();
-    if dir != Vec2::ZERO {
-        let global_dir3d = camera_query.0.forward() * dir.y + camera_query.0.right() * dir.x;
-        let movement_speed = camera_query.1.0;
-        camera_query.0.translation += global_dir3d * delta_secs * movement_speed * speed_up;
+    // 3. Accumulate movement vector
+    let mut wish_dir = Vec3::ZERO;
+
+    if keys.pressed(KeyCode::KeyW) {
+        wish_dir += flat_forward;
     }
+    if keys.pressed(KeyCode::KeyS) {
+        wish_dir -= flat_forward;
+    }
+    if keys.pressed(KeyCode::KeyD) {
+        wish_dir += flat_right;
+    }
+    if keys.pressed(KeyCode::KeyA) {
+        wish_dir -= flat_right;
+    }
+
+    // 4. Update the source controller input
+    input.wish_dir = wish_dir.normalize_or_zero();
+    input.jump = keys.pressed(KeyCode::Space);
+    input.duck = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::KeyC);
 }
 
-#[derive(Component)]
-struct CameraRayHitData(Option<RayHitData>);
-
-/// Should run before shoot_ray_from_camera_draw_intersection
+/// Should run before shoot_ray_from_camera
 fn reset_camera_rayhit_data(
     mut raycaster_query: Single<&mut CameraRayHitData, With<CameraController>>,
 ) {
     raycaster_query.0 = None;
 }
 
-fn shoot_ray_from_camera_draw_intersection(
+fn shoot_ray_from_camera(
     mut raycaster_query: Query<
         (&RayCaster, &RayHits, &mut CameraRayHitData),
         With<CameraController>,
@@ -322,243 +721,296 @@ fn shoot_ray_from_camera_draw_intersection(
     for (_ray, hits, mut camera_rayhit_data) in &mut raycaster_query {
         for hit in hits.iter() {
             camera_rayhit_data.0 = Some(hit.clone());
-            //println!(
-            //    "Hit entity {} at {} with normal {}",
-            //    hit.entity,
-            //    ray.origin + *ray.direction * hit.distance,
-            //    hit.normal,
-            //);
         }
     }
 }
 
-fn modify_display_wall(
+fn modify_display_object(
+    mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
-    mut placeable_wall_query: Single<
-        (&mut AdditionalRotation, &mut PlacementMode),
-        With<DisplayWall>,
+    placeable_objects: Res<PlaceableObjects>,
+    mut placeable_object_query: Single<
+        (
+            Entity,
+            &mut AdditionalRotation,
+            &mut PlacementMode,
+            &mut SelectedPlaceableObject,
+            &mut PursuitProperty,
+        ),
+        With<PlaceableDisplay>,
     >,
-    mut placeable_wall_ui_query: Single<&mut Text, With<DisplayWallUI>>,
+    mut placeable_ui_query: Single<&mut Text, (With<DisplayWallUI>, Without<PlacementMode>)>,
+    mut pursuit_ui_query: Single<&mut Text, (With<PlacementModeUI>, Without<DisplayWallUI>)>,
 ) {
-    // Rotate around Y-axis by PI/2 on 'R'
+    let mut changed = false;
+
+    // Rotate around Y-axis by PI/4 on 'R'
     if keys.just_pressed(KeyCode::KeyR) {
-        placeable_wall_query.0.0 *= Quat::from_rotation_y(PI / 2.0);
+        placeable_object_query.1.0 *= Quat::from_rotation_y(PI / 4.0);
+        changed = true;
     }
 
     // Flip around X-axis by PI/2 on 'F'
     if keys.just_pressed(KeyCode::KeyF) {
-        placeable_wall_query.0.0 *= Quat::from_rotation_z(PI / 2.0);
+        placeable_object_query.1.0 *= Quat::from_rotation_z(PI / 2.0);
+        changed = true;
+    }
+
+    // Normalizing prevents rotational drift
+    if changed {
+        placeable_object_query.1.0 = placeable_object_query.1.0.normalize();
     }
 
     // Switch between absolute elements and joined
     if keys.just_pressed(KeyCode::KeyT) {
-        placeable_wall_query.1.cycle_mode();
-        let ground_walls = *placeable_wall_query.1;
-        placeable_wall_ui_query.0 = format!("Press T to switch grounding mode: {ground_walls}")
+        placeable_object_query.2.cycle_mode();
+        placeable_ui_query.0 = format!(
+            "Press T to switch grounding mode: {}",
+            *placeable_object_query.2
+        );
+    }
+
+    // Switch pursuit mode
+    if keys.just_pressed(KeyCode::KeyC) {
+        placeable_object_query.4.cycle_mode();
+        pursuit_ui_query.0 = format!(
+            "Press C to switch pursuit mode: {}",
+            *placeable_object_query.4
+        );
+    }
+
+    // Change placeable object
+    if keys.just_pressed(KeyCode::Digit1) {
+        let object = placeable_objects.wall.clone();
+        placeable_object_query.3.0 = object.clone();
+        commands
+            .entity(placeable_object_query.0)
+            .insert(SceneRoot(object.clone()));
+    }
+
+    if keys.just_pressed(KeyCode::Digit2) {
+        let object = placeable_objects.target.clone();
+        placeable_object_query.3.0 = object.clone();
+        commands
+            .entity(placeable_object_query.0)
+            .insert(SceneRoot(object.clone()));
+    }
+
+    if keys.just_pressed(KeyCode::Digit3) {
+        let object = placeable_objects.mob.clone();
+        placeable_object_query.3.0 = object.clone();
+        commands
+            .entity(placeable_object_query.0)
+            .insert(SceneRoot(object.clone()));
     }
 }
 
 /// Smoothly transfers object to its position
 /// When LMB is pressed, transfers to end position immediately since in this case,
-/// the next system [place_display_wall] will place the wall down
-fn position_and_draw_display_wall(
-    mut commands: Commands,
+/// the next system [place_display_object] will place the wall down
+fn position_and_draw_display_object(
     keys: Res<ButtonInput<MouseButton>>,
     time: Res<Time>,
-    meshes: Res<Assets<Mesh>>,
+    // Query for Aabb and GlobalTransform
+    child_query: Query<(&Aabb, &GlobalTransform)>,
+    scene_spawner: Res<SceneSpawner>,
     camera_rayhit_query: Single<(&RayCaster, &CameraRayHitData), With<CameraController>>,
     placeable_wall_query: Single<
         (
-            Entity,
-            &RigidBodyComponents,
             &mut Transform,
             &AdditionalRotation,
             &mut Visibility,
-            &Mesh3d,
+            &SceneInstance,
+            &GlobalTransform,
+            &PlacementMode,
         ),
-        With<DisplayWall>,
+        With<PlaceableDisplay>,
     >,
-    rigid_bodies: Query<&RigidBody>,
-    colliders: Query<&Collider>,
 ) {
-    let lmb_pressed = keys.just_pressed(MouseButton::Left);
-
-    let (ray, camera_rayhit_data) = camera_rayhit_query.into_inner();
-    let (entity, rb_components, mut wall_transform, additional_rotation, mut visibility, mesh3d) =
+    let (ray, hit) = camera_rayhit_query.into_inner();
+    let (mut transform, add_rot, mut vis, scene, root_global, placement_mode) =
         placeable_wall_query.into_inner();
 
-    if let Some(rayhit_data) = camera_rayhit_data.0 {
-        // If entity doesn't have rigid body and collider, add them
-        if let Err(_) = rigid_bodies.get(entity) {
-            commands.entity(entity).insert(rb_components.0.clone());
-        }
-        if let Err(_) = colliders.get(entity) {
-            commands.entity(entity).insert(rb_components.1.clone());
-        }
+    let Some(hit_data) = hit.0 else {
+        *vis = Visibility::Hidden;
+        return;
+    };
 
-        let delta_secs = time.delta_secs();
+    // If destroying, don't draw anything
+    if matches!(placement_mode, PlacementMode::Destroying) {
+        *vis = Visibility::Hidden;
+        return;
+    }
 
-        // Rotate mesh to rotation of hit normal, assuming 0 rotation is positive Y-axis
-        // this doesn't change the local rotation introduced by modify_display_wall system
-        // it only adds on top of it a global rotation that hit-normal vector makes with a surface
-        // it hits.
+    // Safety Check: Ensure Normal is valid
+    let up = hit_data.normal.normalize_or_zero();
+    if up == Vec3::ZERO {
+        return;
+    }
 
-        let up = rayhit_data.normal;
-        let mut forward = Vec3::Z - Vec3::Z.project_onto(up); // try to keep world +Z as forward
-        if forward.length_squared() < 1e-6 {
-            forward = Vec3::X; // fallback
-        }
-        let forward = forward.normalize();
-        let right = up.cross(forward).normalize();
-        let corrected_forward = right.cross(up);
+    *vis = Visibility::Visible;
 
-        let align_rotation = Quat::from_mat3(&Mat3::from_cols(right, up, corrected_forward));
+    // Use a threshold to pick the helper vector.
+    // If 'up' is close to Z, use X. Otherwise use Z.
+    let helper = if up.dot(Vec3::Z).abs() > 0.99 {
+        Vec3::X
+    } else {
+        Vec3::Z
+    };
 
-        // First align with normal and then add additional rotation.
-        let target_rotation = align_rotation * additional_rotation.0;
+    // Create the basis vectors
+    let right = up.cross(helper).normalize(); // We know this is safe because of the check above
+    let fwd = right.cross(up); // Orthogonal by definition
 
-        let t = if lmb_pressed {
-            1.0
-        } else {
-            1.0 - (-32.0 * delta_secs).exp()
-        };
-        wall_transform.rotation = wall_transform.rotation.slerp(target_rotation, t);
+    let align_rot = Quat::from_mat3(&Mat3::from_cols(right, up, fwd));
+    let target_rot = (align_rot * add_rot.0).normalize();
 
-        // Strategy to snap to ground:
-        // find the smallest distance of local point in -normal direction from hit_point of all vertices in a mesh
-        // move_by = origin + normal * distance
-        // move mesh by move_by in direction of normal
-        //
-        // anvancement might include adding a collider for intersection detection and not
-        // letting shape get in places it doesn't fit
+    // Smooth rotation
+    let t_rot = if keys.just_pressed(MouseButton::Left) {
+        1.0
+    } else {
+        1.0 - (-32.0 * time.delta_secs()).exp()
+    };
+    if !target_rot.is_nan() {
+        transform.rotation = transform.rotation.slerp(target_rot, t_rot);
+    }
 
-        let mut smallest_displacement: Option<f32> = None;
+    // --- 3. Snap to Surface (NaN Protection) ---
+    // Check if scale is valid before inverting matrix
+    let (scale, _, _) = root_global.to_scale_rotation_translation();
+    if scale.min_element() < 1e-4 {
+        // Scale is too small or zero, cannot compute inverse safely.
+        // Skip snapping this frame to prevent panic.
+        return;
+    }
 
-        if let Some(mesh) = meshes.get(mesh3d) {
-            if let Some(vertex_attribute) = mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
-                match vertex_attribute {
-                    VertexAttributeValues::Float32x3(vertices) => {
-                        for vertex in vertices {
-                            // Respect rotation of mesh
-                            let rotated_vertex =
-                                wall_transform.rotation * Vec3::from_array(*vertex);
+    let root_inv = root_global.affine().inverse();
+    let mut min_dist = f32::MAX;
 
-                            // We are pushing in the direction of rayhit normal
-                            let distance = rayhit_data.normal.dot(rotated_vertex);
+    for entity in scene_spawner.iter_instance_entities(**scene) {
+        if let Ok((aabb, child_global)) = child_query.get(entity) {
+            let to_root = root_inv * child_global.affine();
 
-                            if let Some(smallest) = smallest_displacement {
-                                if distance < smallest {
-                                    smallest_displacement = Some(distance);
-                                }
-                            } else {
-                                smallest_displacement = Some(distance);
-                            }
-                        }
-                    }
-                    _ => {
-                        warn!("Found vertex_attribute but values aren't of type Float32x3!");
-                    }
+            for i in 0..8 {
+                let corner = aabb.center.to_vec3()
+                    + aabb.half_extents.to_vec3()
+                        * Vec3::new(
+                            if i & 1 == 0 { -1.0 } else { 1.0 },
+                            if i & 2 == 0 { -1.0 } else { 1.0 },
+                            if i & 4 == 0 { -1.0 } else { 1.0 },
+                        );
+
+                // Transform corner to Root Space -> Apply *Current* Transform -> Project to Normal
+                let root_local = to_root.transform_point3(corner);
+
+                // Note: We use transform.scale here (Vec3), assuming the object scales uniformly or simple axial.
+                // If transform.rotation is NaN, this calculation becomes NaN.
+                let dynamic_pos = transform.rotation * (root_local * transform.scale);
+
+                let dist = up.dot(dynamic_pos);
+                if dist < min_dist {
+                    min_dist = dist;
                 }
             }
         }
+    }
 
-        let snapping_displacement = if let Some(smallest) = smallest_displacement {
-            rayhit_data.normal * smallest
-        } else {
-            Vec3::ZERO
-        };
+    // Position Application
+    let global_hit_point = ray.global_origin() + ray.global_direction() * hit_data.distance;
 
-        // Determine point where ray hit
-        let global_hit_point = ray.global_origin() + ray.global_direction() * rayhit_data.distance;
-        // Move shape out of the surface (to remove intersections)
-        let snapped_point = global_hit_point - snapping_displacement;
-
-        let transform_lerp_factor = if lmb_pressed { 1.0 } else { 25.0 * delta_secs };
-        wall_transform.translation = if wall_transform.translation.distance(snapped_point) < 8.0 {
-            wall_transform
-                .translation
-                .lerp(snapped_point, transform_lerp_factor)
-        } else {
-            snapped_point
-        };
-
-        *visibility = Visibility::Visible;
+    // Prevent bad values if no children found or math failed
+    let snap_offset = if min_dist != f32::MAX && !min_dist.is_nan() {
+        up * min_dist
     } else {
-        // If entity has rigid body and collider, remove them
-        if let Ok(_) = rigid_bodies.get(entity) {
-            commands.entity(entity).remove::<RigidBody>();
-        }
-        if let Ok(_) = colliders.get(entity) {
-            commands.entity(entity).remove::<Collider>();
-        }
+        Vec3::ZERO
+    };
 
-        // Hide wall visual
-        *visibility = Visibility::Hidden;
+    let target_pos = global_hit_point - snap_offset;
+
+    // Additional Safety: Do not set transform if target is NaN
+    if target_pos.is_nan() {
+        return;
+    }
+
+    let t_pos = if keys.just_pressed(MouseButton::Left) {
+        1.0
+    } else {
+        25.0 * time.delta_secs()
+    };
+
+    // Snap instantly if far away (prevent trailing visual artifacts)
+    if transform.translation.distance_squared(target_pos) > 64.0 {
+        transform.translation = target_pos;
+    } else {
+        transform.translation = transform.translation.lerp(target_pos, t_pos);
     }
 }
 
-/// When placing an element, joints need to connect it to related bodies.
-/// It should be joined to ground when placing on ground (perhaps switch modes
-/// between grounding and default mode); to other structural elements when connecting to them.
-/// Also, there needs to be some sort of magnet to 'snap' elements together.
-/// This magnet might be a calculation on the edge of element to which connecting by offsetting
-/// away from it by the half-depth of connected element.
-fn place_display_wall(
+/// If placed or removed entity, triggers regeneration of navmesh
+fn place_display_object(
+    mut message_writer: MessageWriter<NavmeshRegeneration>,
     mut commands: Commands,
+    window_query: Single<(&Window, &CursorOptions)>,
     keys: Res<ButtonInput<MouseButton>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    hierarchy_query: Query<&ChildOf>,
     camera_rayhit_query: Single<&CameraRayHitData, With<CameraController>>,
     placeable_wall_query: Single<
         (
             &Transform,
-            &Mesh3d,
-            &MeshMaterial3d<StandardMaterial>,
-            &RigidBodyComponents,
             &PlacementMode,
+            &SelectedPlaceableObject,
+            &PursuitProperty,
             &Visibility,
         ),
-        With<DisplayWall>,
+        With<PlaceableDisplay>,
     >,
-    window_query: Single<(&Window, &CursorOptions)>,
-    transforms_query: Query<&Transform>,
+    destructible_query: Query<Entity, With<DestructibleParams>>,
 ) {
     // In order to place a wall we need to know which direction is ground
     let Some(rayhit_data) = camera_rayhit_query.0 else {
         return;
     };
-    let hit_entity = rayhit_data.entity;
     let hit_normal = rayhit_data.normal;
+    let hit_entity = rayhit_data.entity;
 
     let window_focused = window_query.0.focused;
     let cursor_locked = window_query.1.grab_mode == CursorGrabMode::Locked;
-    let wall_visible = placeable_wall_query.5 == Visibility::Visible;
+    let wall_visible = placeable_wall_query.4 == Visibility::Visible;
+    let placement_mode_destroy = matches!(placeable_wall_query.1, PlacementMode::Destroying);
 
-    if keys.just_pressed(MouseButton::Left) && window_focused && cursor_locked && wall_visible {
-        let (wall_transform, mesh3d, material3d, rb_components, placement_mode, _) =
+    if keys.just_pressed(MouseButton::Left)
+        && window_focused
+        && cursor_locked
+        && (wall_visible || placement_mode_destroy)
+    {
+        let (self_transform, placement_mode, selected_placeable_object, pursuit_property, _) =
             placeable_wall_query.into_inner();
 
-        // Clone the mesh handle directly (meshes are shared, no need to clone the actual Mesh data)
-        let mesh_handle = mesh3d.0.clone();
+        let mut added_entity: Option<Entity> = None;
 
-        // Get the original material, clone it, modify alpha, and add to assets for a new handle
-        let Some(original_material) = materials.get(&material3d.0) else {
-            warn!("Couldn't find material in place_display_wall.");
-            return;
-        };
-        let mut new_material = original_material.clone();
-        new_material.base_color = new_material.base_color.with_alpha(1.0);
-        let new_material_handle = materials.add(new_material);
+        let mut regenerate_navmesh = false;
 
         match placement_mode {
-            PlacementMode::Grounding => {
-                println!("grounding wall");
+            PlacementMode::Static => {
+                let entity = commands
+                    .spawn((
+                        DestructibleParams::new(100.0),
+                        SceneRoot(selected_placeable_object.0.clone()),
+                        self_transform.clone(),
+                        RigidBody::Static,
+                    ))
+                    .id();
 
+                added_entity = Some(entity);
+                regenerate_navmesh = true;
+            }
+            PlacementMode::Grounding => {
                 // To place on ground, create an invisible static body for the sole purpose of
                 // connecting new piece to it.
                 // It should be placed in the direction opposite to hit normal and some distance away
                 // from new object's center.
 
-                let other_translation = (wall_transform.translation - hit_normal * 2.0).into();
+                let other_translation = (self_transform.translation - hit_normal * 2.0).into();
                 let other_rotation = Quat::IDENTITY;
                 let other_transform = Transform::from_isometry(Isometry3d {
                     rotation: other_rotation,
@@ -569,13 +1021,13 @@ fn place_display_wall(
 
                 let new_entity = commands
                     .spawn((
-                        Wall,
-                        Mesh3d(mesh_handle),
-                        MeshMaterial3d(new_material_handle),
-                        wall_transform.clone(),
-                        rb_components.0.clone(),
-                        rb_components.1.clone(),
+                        DestructibleParams::new(100.0),
+                        SceneRoot(selected_placeable_object.0.clone()),
+                        self_transform.clone(),
+                        RigidBody::Dynamic,
                         ColliderDensity(8.0),
+                        LinearDamping(2.0),
+                        AngularDamping(2.0),
                         SleepThreshold {
                             linear: 0.6,
                             angular: 0.6,
@@ -583,109 +1035,194 @@ fn place_display_wall(
                     ))
                     .id();
 
-                // 1. Define the joint frame to be exactly at the center of the NEW entity.
-                // Relative to the new entity, its own center is Vec3::ZERO.
+                // Define the joint frame to be exactly at the center of the NEW entity.
+                // Relative to the new entity, its own center is Vec3 ZERO.
                 let anchor_on_new = Vec3::ZERO;
                 let basis_on_new = Quat::IDENTITY;
 
-                // 2. Calculate where the new entity is relative to the HIT entity.
+                // Calculate where the new entity is relative to the HIT entity.
                 // We convert the new wall's world position into the hit object's local space.
                 let anchor_on_hit = other_transform.rotation.inverse()
-                    * (wall_transform.translation - other_transform.translation);
-                // 3. Calculate the relative rotation.
-                let basis_on_hit = other_transform.rotation.inverse() * wall_transform.rotation;
+                    * (self_transform.translation - other_transform.translation);
+                // Calculate the relative rotation.
+                let basis_on_hit = other_transform.rotation.inverse() * self_transform.rotation;
 
                 commands.spawn(
                     FixedJoint::new(new_entity, other_entity)
-                        // Body 1 (New Wall): Connect at its center
                         .with_local_anchor1(anchor_on_new)
                         .with_local_basis1(basis_on_new)
-                        // Body 2 (Hit Object): Connect at the calculated relative offset
                         .with_local_anchor2(anchor_on_hit)
                         .with_local_basis2(basis_on_hit),
                 );
-            }
-            PlacementMode::Connecting => {
-                println!("connecting wall");
 
-                // just try connecting it to center of hit body
-                if let Ok(other_transform) = transforms_query.get(hit_entity) {
-                    let new_entity = commands
-                        .spawn((
-                            Wall,
-                            Mesh3d(mesh_handle),
-                            MeshMaterial3d(new_material_handle),
-                            wall_transform.clone(),
-                            rb_components.0.clone(),
-                            rb_components.1.clone(),
-                            ColliderDensity(8.0),
-                            SleepThreshold {
-                                linear: 0.6,
-                                angular: 0.6,
-                            },
-                        ))
-                        .id();
-
-                    // 1. Define the joint frame to be exactly at the center of the NEW entity.
-                    // Relative to the new entity, its own center is Vec3::ZERO.
-                    let anchor_on_new = Vec3::ZERO;
-                    let basis_on_new = Quat::IDENTITY;
-
-                    // 2. Calculate where the new entity is relative to the HIT entity.
-                    // We convert the new wall's world position into the hit object's local space.
-                    let anchor_on_hit = other_transform.rotation.inverse()
-                        * (wall_transform.translation - other_transform.translation);
-
-                    // 3. Calculate the relative rotation.
-                    let basis_on_hit = other_transform.rotation.inverse() * wall_transform.rotation;
-
-                    commands.spawn(
-                        FixedJoint::new(new_entity, hit_entity)
-                            // Body 1 (New Wall): Connect at its center
-                            .with_local_anchor1(anchor_on_new)
-                            .with_local_basis1(basis_on_new)
-                            // Body 2 (Hit Object): Connect at the calculated relative offset
-                            .with_local_anchor2(anchor_on_hit)
-                            .with_local_basis2(basis_on_hit),
-                    );
-                } else {
-                    // NOTE can it not have transform if ray hit it?
-                    // If it doesn't have transform, create some distance away in -normal direction
-                    // from wall center.
-                }
+                added_entity = Some(new_entity);
+                regenerate_navmesh = true;
             }
             PlacementMode::Destroying => {
-                println!("destroying wall");
+                // Go through all ansestors and check if any have DestructibleParams
+                let destructible_parent_opt = hierarchy_query
+                    .iter_ancestors(hit_entity)
+                    .find(|a| destructible_query.get(*a).is_ok());
+
+                if let Some(destructible_parent) = destructible_parent_opt {
+                    commands.entity(destructible_parent).insert(DestroyedObject);
+                    regenerate_navmesh = true;
+                }
+            }
+        }
+
+        if let Some(entity) = added_entity {
+            pursuit_property.add_appropriate_tag_to_entity(commands, entity);
+        }
+
+        if regenerate_navmesh == true {
+            message_writer.write(NavmeshRegeneration);
+        }
+    }
+}
+
+#[inline]
+fn is_descendant_of(
+    parent: Entity,
+    maybe_descendant: Entity,
+    hierarchy_query: Query<&ChildOf>,
+) -> bool {
+    hierarchy_query
+        .iter_ancestors(maybe_descendant)
+        .any(|a| a == parent)
+}
+
+fn add_colliders_to_new_scenes(
+    mut commands: Commands,
+    hierarchy_query: Query<&ChildOf>,
+    placeable_display_query: Single<Entity, With<PlaceableDisplay>>,
+    names_query: Query<&Name>,
+    mesh_query: Query<(Entity, &ChildOf), Added<Mesh3d>>,
+) {
+    let placeable_display_entity = placeable_display_query.into_inner();
+    for (entity, parent) in mesh_query {
+        if let Ok(parent_name) = names_query.get(parent.0) {
+            if parent_name.starts_with("collider_") {
+                if is_descendant_of(placeable_display_entity, entity, hierarchy_query) {
+                    commands.entity(entity).insert((
+                        ColliderConstructor::ConvexHullFromMesh,
+                        ColliderDisabled,
+                        Visibility::Hidden,
+                    ));
+                } else {
+                    commands
+                        .entity(entity)
+                        .insert((ColliderConstructor::ConvexHullFromMesh, Visibility::Hidden));
+                }
             }
         }
     }
 }
 
-const BALL_VEL: f32 = 30.0;
+fn player_collision_mark_destroyed_entities(
+    observation: On<CollisionStart>,
+    mut message_writer: MessageWriter<NavmeshRegeneration>,
+    mut commands: Commands,
+    game_sounds: Res<GameSounds>,
+    collisions: Collisions,
+    destructible_query: Query<&DestructibleParams>,
+    player_query: Single<(&LinearVelocity, &ComputedMass), With<CameraController>>,
+    transforms_query: Query<&Transform>,
+) {
+    let observer_collider = observation.event().event_target();
 
-#[derive(Component)]
-struct BallDestructionTimer(Timer);
+    // Find other body as collider might be attached to a child entity
+    let other_body = if observation.collider1 == observer_collider {
+        observation.body2.unwrap_or(observation.collider2)
+    } else {
+        observation.body1.unwrap_or(observation.collider1)
+    };
 
-fn push_last_floor(
+    // If body we hit isn't destructible, then simply return
+    // NOTE: Or maybe damage the player on impact
+    let Ok(destructible_params) = destructible_query.get(other_body).cloned() else {
+        return;
+    };
+
+    let (lin_vel, mass) = *player_query;
+
+    if let Some(contacts) = collisions.get(observation.collider1, observation.collider2) {
+        if let Some(manifold) = contacts.manifolds.first() {
+            // Kinematic bodies don't have impulse calculated by engine, so do it manually.
+            // NOTE: This implementation doesn't take the other body's velocity or mass.
+            let contact_normal = manifold.normal;
+            // We don't care which way the normal points
+            let collision_speed = lin_vel.dot(contact_normal).abs();
+            let collision_impulse = collision_speed * mass.value();
+
+            // Mark entity for destruction if impulse is sufficient
+            if collision_impulse > destructible_params.impulse_resistance {
+                commands.entity(other_body).insert(DestroyedObject);
+                message_writer.write(NavmeshRegeneration);
+
+                // Spawn wall destruction sound at destructible's position
+                if let Ok(other_transform) = transforms_query.get(other_body) {
+                    commands.spawn((
+                        other_transform.clone(),
+                        AudioPlayer::new(game_sounds.concrete_crumbling.clone()),
+                        PlaybackSettings::DESPAWN
+                            .with_spatial(true)
+                            .with_spatial_scale(bevy::audio::SpatialScale::new(0.25))
+                            .with_volume(Volume::Linear(2.0)),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn remove_destroyed_entities(
+    mut commands: Commands,
+    destroyed_query: Query<Entity, With<DestroyedObject>>,
+) {
+    for destroyed_entity in destroyed_query {
+        commands.entity(destroyed_entity).despawn();
+    }
+}
+
+fn shoot_ball(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    game_sounds: Res<GameSounds>,
     keypresses: Res<ButtonInput<KeyCode>>,
-    camera_query: Single<&Transform, With<CameraController>>,
+    camera_query: Single<(Entity, &GlobalTransform), With<CameraController>>,
 ) {
     if keypresses.just_pressed(KeyCode::KeyB) {
-        let shoot_vector = camera_query.forward();
-        let ball_spawn_p = camera_query.translation;
-        commands.spawn((
-            RigidBody::Dynamic,
-            Collider::sphere(0.5),
-            CollisionLayers::new([GameLayer::Ball], [GameLayer::Default]),
-            ColliderDensity(8.0),
-            Mesh3d(meshes.add(Sphere::new(0.5))),
-            MeshMaterial3d(materials.add(StandardMaterial::from_color(Color::srgb(0.3, 0.4, 0.9)))),
-            Transform::from_translation(ball_spawn_p),
-            LinearVelocity(shoot_vector * BALL_VEL),
-            BallDestructionTimer(Timer::new(Duration::from_secs_f32(5.0), TimerMode::Once)),
+        let (cam_entity, cam_transform) = *camera_query;
+        let shoot_vector = cam_transform.forward();
+        let ball_spawn_p = cam_transform.translation();
+        let ball_spawn_transform = Transform::from_translation(ball_spawn_p);
+        commands
+            .spawn((
+                RigidBody::Dynamic,
+                Collider::sphere(0.5),
+                CollisionLayers::new([GameLayer::Ball], [GameLayer::Default, GameLayer::Ball]),
+                ColliderDensity(8.0),
+                CollisionEventsEnabled,
+                Mesh3d(meshes.add(Sphere::new(0.5))),
+                MeshMaterial3d(
+                    materials.add(StandardMaterial::from_color(Color::srgb(0.3, 0.4, 0.9))),
+                ),
+                ball_spawn_transform.clone(),
+                Projectile,
+                Ball,
+                LinearVelocity(shoot_vector * 30.0),
+                DestructionTimer(Timer::new(Duration::from_secs_f32(10.0), TimerMode::Once)),
+            ))
+            .observe(ball_collision_mark_destroyed_entities);
+        // Spawn sound
+        commands.entity(cam_entity).with_child((
+            Transform::IDENTITY,
+            AudioPlayer::new(game_sounds.steampunk_weapon_shot.clone()),
+            PlaybackSettings::DESPAWN
+                .with_spatial(true)
+                .with_volume(bevy::audio::Volume::Linear(0.35)),
         ));
     }
 }
@@ -693,12 +1230,97 @@ fn push_last_floor(
 fn handle_ball_despawning(
     mut commands: Commands,
     time: Res<Time>,
-    mut ball_destruction_timers_query: Query<(Entity, &mut BallDestructionTimer)>,
+    mut ball_destruction_timers_query: Query<(Entity, &mut DestructionTimer)>,
 ) {
     for (entity, mut timer) in &mut ball_destruction_timers_query {
         timer.0.tick(time.delta());
         if timer.0.is_finished() {
             commands.entity(entity).despawn();
         }
+    }
+}
+
+fn ball_collision_mark_destroyed_entities(
+    observation: On<CollisionStart>,
+    mut message_writer: MessageWriter<NavmeshRegeneration>,
+    mut commands: Commands,
+    game_sounds: Res<GameSounds>,
+    collisions: Collisions,
+    destructible_query: Query<&DestructibleParams>,
+    transforms_query: Query<&Transform>,
+) {
+    let observer_collider = observation.event().event_target();
+
+    let observer_body = if observation.collider1 == observer_collider {
+        observation.body1.unwrap_or(observation.collider1)
+    } else {
+        observation.body2.unwrap_or(observation.collider2)
+    };
+
+    // Find other body as collider might be attached to a child entity
+    let other_body = if observation.collider1 == observer_collider {
+        observation.body2.unwrap_or(observation.collider2)
+    } else {
+        observation.body1.unwrap_or(observation.collider1)
+    };
+
+    // If body we hit isn't destructible, then simply return
+    // NOTE: Or maybe damage the ball (projectile) on impact
+    let Ok(destructible_params) = destructible_query.get(other_body).cloned() else {
+        return;
+    };
+
+    if let Some(contacts) = collisions.get(observation.collider1, observation.collider2) {
+        if let Some(manifold) = contacts.manifolds.first() {
+            let total_impulse = manifold.total_normal_impulse();
+
+            // Spawn collision sound at ball's position if impulse is sufficient
+            if total_impulse > 2.0 {
+                if let Ok(ball_transform) = transforms_query.get(observer_body) {
+                    commands.spawn((
+                        ball_transform.clone(),
+                        AudioPlayer::new(game_sounds.metal_ball_concrete_collision.clone()),
+                        PlaybackSettings::DESPAWN
+                            .with_spatial(true)
+                            .with_spatial_scale(bevy::audio::SpatialScale::new(0.25))
+                            .with_volume(Volume::Linear(2.0)),
+                    ));
+                }
+            }
+
+            // Mark entity for destruction if impulse is sufficient
+            if total_impulse > destructible_params.impulse_resistance {
+                commands.entity(other_body).insert(DestroyedObject);
+                message_writer.write(NavmeshRegeneration);
+
+                // Spawn wall destruction sound at destructible's position
+                if let Ok(other_transform) = transforms_query.get(other_body) {
+                    commands.spawn((
+                        other_transform.clone(),
+                        AudioPlayer::new(game_sounds.concrete_crumbling.clone()),
+                        PlaybackSettings::DESPAWN
+                            .with_spatial(true)
+                            .with_spatial_scale(bevy::audio::SpatialScale::new(0.25))
+                            .with_volume(Volume::Linear(2.0)),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn print_added_pursuit_tag(
+    wall_q: Query<Entity, Added<Wall>>,
+    target_q: Query<Entity, Added<Target>>,
+    mob_q: Query<Entity, Added<Mob>>,
+) {
+    for e in wall_q {
+        info!("Added wall {e}");
+    }
+    for e in target_q {
+        info!("Added target {e}");
+    }
+    for e in mob_q {
+        info!("Added mob {e}");
     }
 }
