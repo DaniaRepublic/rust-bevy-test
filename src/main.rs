@@ -1,6 +1,6 @@
 //! The app in this file demoes some destruction capabilities of physics scenes.
 
-use std::{fmt::Display, time::Duration};
+use std::{collections::HashMap, fmt::Display, time::Duration};
 
 use avian_rerecast::AvianBackendPlugin;
 use avian3d::{
@@ -15,7 +15,6 @@ use bevy::{
     input::common_conditions::input_just_pressed,
     math::Vec3,
     mesh::{Indices, PrimitiveTopology},
-    platform::collections::HashMap,
     prelude::*,
     scene::SceneInstance,
     window::{CursorGrabMode, CursorOptions},
@@ -78,8 +77,7 @@ fn main() {
                 modify_display_object,
                 position_and_draw_display_object,
                 place_display_object,
-                add_colliders_to_new_scenes,
-                print_added_pursuit_tag,
+                add_colliders_to_new_meshes,
             )
                 .chain(),
         )
@@ -1092,15 +1090,15 @@ fn is_descendant_of(
         .any(|a| a == parent)
 }
 
-fn add_colliders_to_new_scenes(
+fn add_colliders_to_new_meshes(
     mut commands: Commands,
     hierarchy_query: Query<&ChildOf>,
-    placeable_display_query: Single<Entity, With<PlaceableDisplay>>,
+    placeable_display_single: Single<Entity, With<PlaceableDisplay>>,
     names_query: Query<&Name>,
-    mesh_query: Query<(Entity, &ChildOf), Added<Mesh3d>>,
+    new_mesh_query: Query<(Entity, &ChildOf), Added<Mesh3d>>,
 ) {
-    let placeable_display_entity = placeable_display_query.into_inner();
-    for (entity, parent) in mesh_query {
+    let placeable_display_entity = placeable_display_single.into_inner();
+    for (entity, parent) in new_mesh_query {
         if let Ok(parent_name) = names_query.get(parent.0) {
             if parent_name.starts_with("collider_") {
                 if is_descendant_of(placeable_display_entity, entity, hierarchy_query) {
@@ -1306,21 +1304,5 @@ fn ball_collision_mark_destroyed_entities(
                 }
             }
         }
-    }
-}
-
-fn print_added_pursuit_tag(
-    wall_q: Query<Entity, Added<Wall>>,
-    target_q: Query<Entity, Added<Target>>,
-    mob_q: Query<Entity, Added<Mob>>,
-) {
-    for e in wall_q {
-        info!("Added wall {e}");
-    }
-    for e in target_q {
-        info!("Added target {e}");
-    }
-    for e in mob_q {
-        info!("Added mob {e}");
     }
 }

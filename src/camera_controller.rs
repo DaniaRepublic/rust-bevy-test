@@ -35,6 +35,9 @@ impl Plugin for CameraControllerPlugin {
 pub const RADIANS_PER_DOT: f32 = 0.00025; // feels good
 
 /// Camera controller [`Component`].
+/// If using a [camera_movement] system, you can add [CameraMoveSpeed] and [CameraMoveSpeedMult] to the
+/// same entity that has [CameraController] to controll the speed and speed multiplier of movement.
+/// Default values for them are: CameraMoveSpeed(5.0) and CameraMoveSpeedMult(3.0).
 #[derive(Component)]
 pub struct CameraController {
     /// Enables this [`CameraController`] when `true`.
@@ -241,6 +244,9 @@ pub struct CameraMoveSpeedMult(pub f32);
 
 /// Optional basic movement system for controller.
 /// Usefull when don't want a separate character controller.
+/// You can add [CameraMoveSpeed] and [CameraMoveSpeedMult] to the same entity that
+/// has [CameraController] to controll the speed and speed multiplier of movement.
+/// Default values for them are: CameraMoveSpeed(5.0) and CameraMoveSpeedMult(3.0).
 #[allow(dead_code)]
 pub fn camera_movement(
     time: Res<Time>,
