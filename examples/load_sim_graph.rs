@@ -2,15 +2,15 @@
 //! Import: Detect "Simulation_Graph" mesh -> Match Vertices to Sibling Meshes -> Build Kernel.
 //! Update: Apply Avian Collisions -> Run Solver -> Sync Child Transforms.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::Duration};
 
 use avian3d::prelude::*;
 use bevy::{
-    math::{DQuat, DVec3},
+    math::DVec3,
     mesh::{Indices, VertexAttributeValues},
     platform::collections::HashMap,
     prelude::*,
-    scene::{SceneInstance, SceneInstanceReady},
+    scene::SceneInstanceReady,
 };
 
 // Assuming these modules exist in your project structure
@@ -20,6 +20,7 @@ use camera_controller::*;
 #[path = "./helpers/integrated_stress_sim.rs"]
 mod integrated_stress_sim;
 use integrated_stress_sim::*;
+use kiddo::{KdTree, SquaredEuclidean};
 
 fn main() {
     App::new()
@@ -39,13 +40,12 @@ fn main() {
         //.add_systems(
         //    Update,
         //    (
-        //        //add_colliders_to_new_meshes,
-        //        //setup_structural_sim_from_scene,
         //        //handle_structure_collisions,
         //        //handle_structural_splitting,
         //    ),
         //)
         .add_systems(Update, (render_sims, handle_input_force))
+        .add_systems(Update, (shoot_ball, handle_ball_despawning))
         .add_observer(handle_scene_added)
         .run();
 }
@@ -56,14 +56,22 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
-    // Load the GLTF.
-    // The Setup system will detect "Simulation_Graph" inside this scene.
+    // Load the glb scene.
     commands.spawn((
         SceneRoot(
             asset_server
-                .load(GltfAssetLabel::Scene(0).from_asset("models/WoodenModularHuts/Hut.glb")),
+                .load(GltfAssetLabel::Scene(0).from_asset("models/WoodenModularHuts/Hut.001.glb")),
         ),
         Transform::from_xyz(10., 0., 0.),
+    ));
+
+    // Load another copy at a different position for testing.
+    commands.spawn((
+        SceneRoot(
+            asset_server
+                .load(GltfAssetLabel::Scene(0).from_asset("models/WoodenModularHuts/Hut.001.glb")),
+        ),
+        Transform::from_xyz(-10., 0., 0.),
     ));
 
     // Camera
@@ -92,23 +100,6 @@ fn setup(
 // SETUP & ARCHITECTURE
 // =========================================================================
 
-fn add_colliders_to_new_meshes(
-    mut commands: Commands,
-    names_query: Query<&Name>,
-    new_mesh_query: Query<(Entity, &ChildOf), Added<Mesh3d>>,
-) {
-    for (entity, parent) in new_mesh_query {
-        if let Ok(parent_name) = names_query.get(parent.0) {
-            if parent_name.starts_with("collider_aabb") {
-                println!("adding collider to {}", entity);
-                commands
-                    .entity(entity)
-                    .insert((ColliderConstructor::ConvexHullFromMesh, Visibility::Hidden));
-            }
-        }
-    }
-}
-
 /// Scene has global transform, its children only have transform.
 /// If scene has Simulation_Graph_Obj, then its structure is as follows:
 /// ```text
@@ -116,13 +107,13 @@ fn add_colliders_to_new_meshes(
 ///     Simulation_Graph_Obj {
 ///         Simulation_Graph_Data
 ///     }
-///     MeshObj.1 {
+///     visual_MeshObj.1 {
 ///         MeshData.1
 ///         collider_obj_MeshObj.1 {
 ///             collider_box_MeshObj.1
 ///         }
 ///     }
-///     MeshObj.2 {
+///     visual_MeshObj.2 {
 ///         MeshData.2
 ///         collider_obj_MeshObj.2 {
 ///             collider_box_MeshObj.2
@@ -135,13 +126,13 @@ fn add_colliders_to_new_meshes(
 /// Otherwise, it's structure is as follows:
 /// ```text
 /// RootObj {
-///     MeshObj.1 {
+///     visual_MeshObj.1 {
 ///         MeshData.1
 ///         collider_obj_MeshObj.1 {
 ///             collider_box_MeshObj.1
 ///         }
 ///     }
-///     MeshObj.2 {
+///     visual_MeshObj.2 {
 ///         MeshData.2
 ///         collider_obj_MeshObj.2 {
 ///             collider_box_MeshObj.2
@@ -159,23 +150,22 @@ fn handle_scene_added(
     mesh_handles: Query<&Mesh3d>,
     transforms: Query<&Transform>,
     global_transforms: Query<&GlobalTransform>,
+    children_of: Query<&ChildOf>,
 ) {
-    info!("Scene instance ready.");
+    info!("Processing new scene instance.");
 
     let scene_entity = event.entity;
     commands
         .entity(scene_entity)
-        .insert((RigidBody::Kinematic,)); //LinearVelocity(Vec3::new(0., 1., 0.))
+        .insert((RigidBody::Kinematic,));
 
     let scene_global_tr = global_transforms
         .get(scene_entity)
         .unwrap_or(&GlobalTransform::IDENTITY);
-    info!(
-        "scene global translation is: {}",
-        scene_global_tr.translation()
-    );
 
-    let mut scene_meshes: Vec<Vec3> = Vec::new();
+    // Use parallel arrays for colliders
+    let mut colliders_pos: Vec<Vec3> = Vec::new();
+    let mut colliders_entity: Vec<Entity> = Vec::new();
 
     let mut graph_obj_entity: Option<Entity> = None;
     let mut graph_data_entity: Option<Entity> = None;
@@ -191,10 +181,47 @@ fn handle_scene_added(
             } else if child_name.starts_with("Simulation_Graph_Data") {
                 graph_data_entity = Some(entity);
             } else if child_name.starts_with("collider_box_") {
-                // Create collider from collider mesh
-                commands
-                    .entity(entity)
-                    .insert((ColliderConstructor::ConvexHullFromMesh, Visibility::Hidden));
+                // Create collider from collider mesh.
+                // Colliders will be connected with simulation graph nodes so collect transforms
+                // along with entities to use them for matching later. This isn't very expensive,
+                // so do here even if scene isn't simulated.
+                commands.entity(entity).insert((
+                    ColliderConstructor::ConvexHullFromMesh,
+                    CollisionEventsEnabled,
+                    Visibility::Hidden,
+                ));
+                // Parent has translation relative to visual mesh
+                let Ok(child_of) = children_of.get(entity) else {
+                    error!("Collider doesn't have a parent.");
+                    return;
+                };
+                let parent_entity = child_of.parent();
+                // Grandparent is a visual mesh and has translation relative to scene
+                let Ok(grandchild_of) = children_of.get(child_of.parent()) else {
+                    error!("Collider doesn't have a grandparent.");
+                    return;
+                };
+                let grandparent_entity = grandchild_of.parent();
+
+                let parent_tf = transforms
+                    .get(parent_entity)
+                    .unwrap_or(&Transform::IDENTITY);
+                let grandparent_tf = transforms
+                    .get(grandparent_entity)
+                    .unwrap_or(&Transform::IDENTITY);
+
+                // 1. We assume the 'collider_box' entity itself is at 0,0,0 relative to its parent (collider_obj).
+                //    So the point in "Parent Space" is just Vec3::ZERO.
+                // 2. Convert to "Grandparent Space" (Visual Mesh Space):
+                let pos_in_visual_mesh = parent_tf.transform_point(Vec3::ZERO);
+
+                // 3. Convert to "Scene Space" (Root Space):
+                //    We apply the Grandparent's transform (including its rotation!) to the point.
+                let collider_local_pos = grandparent_tf.transform_point(pos_in_visual_mesh);
+
+                colliders_pos.push(collider_local_pos);
+                colliders_entity.push(entity);
+            } else if child_name.starts_with("visual_") {
             }
         }
     }
@@ -218,6 +245,13 @@ fn handle_scene_added(
         return;
     };
 
+    // Get Graph's Local Transform to convert translation of vertices to local space relative to scene
+    // root
+    let graph_obj_transform = transforms
+        .get(graph_obj_entity)
+        .unwrap_or(&Transform::IDENTITY);
+
+    // to match graph nodes against colliders
     let positions = match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
         Some(VertexAttributeValues::Float32x3(p)) => p,
         _ => {
@@ -225,239 +259,102 @@ fn handle_scene_added(
             return;
         }
     };
-    let colors: Option<&Vec<[f32; 4]>> = match mesh.attribute(Mesh::ATTRIBUTE_COLOR) {
-        Some(VertexAttributeValues::Float32x4(c)) => Some(c),
-        _ => None,
+    let graph_local_positions: Vec<Vec3> = positions
+        .iter()
+        .map(|e| graph_obj_transform.transform_point(Vec3::from(*e)))
+        .collect();
+
+    // Red value determines if node is fixed
+    let colors: &Vec<[f32; 4]> = match mesh.attribute(Mesh::ATTRIBUTE_COLOR) {
+        Some(VertexAttributeValues::Float32x4(c)) => c,
+        _ => &vec![[0., 0., 0., 1.]; positions.len()],
     };
 
-    // Get Graph's Local Transform to convert Vertices -> Wrapper Space
-    let graph_obj_local_tr = transforms
-        .get(graph_obj_entity)
-        .unwrap_or(&Transform::IDENTITY);
-    info!(
-        "graph object local translation is: {}",
-        graph_obj_local_tr.translation
-    );
+    let pairings = pair_vectors_optimized(&colliders_pos, &graph_local_positions);
+
+    assert_eq!(pairings.len(), positions.len());
+
+    let cm_squared = 0.01 * 0.01;
+    for (idx_a, idx_b) in pairings.iter() {
+        assert!(colliders_pos[*idx_a].distance_squared(graph_local_positions[*idx_b]) < cm_squared);
+    }
+
+    // Now we can create StructuralSim.
+    let mut structural_sim = StructuralSim::new();
+
+    let mut graph_idx_to_node = HashMap::<usize, usize>::new();
+
+    // First, create nodes and attach SimPart component to respective collider.
+    for (idx_collider, idx_graph) in pairings {
+        // Red value threashold is 0.5
+        let fixed = colors[idx_graph][0] > 0.5;
+        // Use global pos of graph node
+        let pos = scene_global_tr.transform_point(graph_local_positions[idx_graph]);
+        let node_index =
+            structural_sim.add_node(fixed, pos, Vec3::ZERO, Quat::IDENTITY, Vec3::ZERO);
+
+        commands
+            .entity(colliders_entity[idx_collider])
+            .insert(SimPart {
+                root_entity: scene_entity,
+                node_index,
+            });
+
+        graph_idx_to_node.insert(idx_graph, node_index);
+    }
+
+    // Then, create connections, build island, etc. to finish StructuralSim setup.
+    if let Some(indices) = mesh.indices() {
+        let indices_iter: Box<dyn Iterator<Item = usize>> = match indices {
+            Indices::U16(idxs) => Box::new(idxs.iter().map(|v| *v as usize)),
+            Indices::U32(idxs) => Box::new(idxs.iter().map(|v| *v as usize)),
+        };
+        let indices: Vec<usize> = indices_iter.collect();
+        for edge in indices.chunks_exact(2) {
+            let idx_a = edge[0];
+            let idx_b = edge[1];
+
+            let Some(node_a) = graph_idx_to_node.get(&idx_a) else {
+                error!("Node for vertex {} wasn't created.", idx_a);
+                continue;
+            };
+            let Some(node_b) = graph_idx_to_node.get(&idx_b) else {
+                error!("Node for vertex {} wasn't created.", idx_b);
+                continue;
+            };
+
+            structural_sim.add_conn(*node_a, *node_b);
+        }
+    }
+
+    structural_sim.create_island();
+
+    commands.entity(scene_entity).insert(structural_sim);
+
+    info!("StructuralSim was set up and added to scene entity successfully!");
 }
 
-// Define a marker to ensure we process each scene instance exactly once
-#[derive(Component)]
-pub struct StructuralSceneProcessed;
+// Returns a vector of pairs of indices of spacially matching elements.
+pub fn pair_vectors_optimized(list_a: &Vec<Vec3>, list_b: &Vec<Vec3>) -> Vec<(usize, usize)> {
+    assert_eq!(list_a.len(), list_b.len());
 
-fn setup_structural_sim_from_scene(
-    mut commands: Commands,
-    // Query for scenes that are loaded but not yet processed
-    scenes: Query<(Entity, &SceneInstance), Without<StructuralSceneProcessed>>,
-    scene_spawner: Res<SceneSpawner>,
+    // 1. Build k-d tree
+    let mut tree: KdTree<f32, 3> = KdTree::with_capacity(list_b.len());
 
-    // Data Access
-    names: Query<&Name>,
-    children: Query<&Children>,
-    parents: Query<&ChildOf>,
-    transforms: Query<&Transform>,
-    meshes: Res<Assets<Mesh>>,
-    mesh_handles: Query<&Mesh3d>,
-) {
-    for (scene_entity, instance) in scenes.iter() {
-        // Critical Check: Is the GLTF fully spawned?
-        if !scene_spawner.instance_is_ready(**instance) {
-            continue;
-        }
-
-        // Mark as processed immediately
-        commands
-            .entity(scene_entity)
-            .insert(StructuralSceneProcessed);
-        info!(
-            "Scene Instance {:?} is ready. Analyzing structure...",
-            scene_entity
-        );
-
-        // 1. FIND THE SIMULATION GRAPH
-        // We iterate ONLY the entities in this specific scene instance
-        let mut graph_entity = None;
-        for entity in scene_spawner.iter_instance_entities(**instance) {
-            if let Ok(name) = names.get(entity) {
-                if name.as_str().starts_with("Simulation_Graph") {
-                    graph_entity = Some(entity);
-                    break;
-                }
-            }
-        }
-
-        let Some(graph_entity) = graph_entity else {
-            // This scene might be just environment/props, skip warning if not expected
-            continue;
-        };
-
-        // 2. IDENTIFY THE STRUCTURE ROOT (Parent Wrapper)
-        // The graph is a child of the object that holds the parts.
-        let Ok(wrapper_entity) = parents.get(graph_entity).map(|p| p.parent()) else {
-            warn!(
-                "Simulation Graph {:?} has no parent! Structure invalid.",
-                graph_entity
-            );
-            continue;
-        };
-
-        let root_name = names
-            .get(wrapper_entity)
-            .map(|n| n.as_str())
-            .unwrap_or("Unknown");
-        info!(
-            "Identified Structure Root: '{}' ({:?})",
-            root_name, wrapper_entity
-        );
-
-        // 3. COLLECT CANDIDATE PARTS (Siblings)
-        // We assume all "Parts" are siblings of the "Simulation_Graph"
-        let mut part_candidates = Vec::new();
-        if let Ok(siblings) = children.get(wrapper_entity) {
-            for &sibling in siblings {
-                if sibling == graph_entity {
-                    continue;
-                }
-
-                // We capture the Local Transform (Position relative to Wrapper)
-                if let Ok(tr) = transforms.get(sibling) {
-                    part_candidates.push((sibling, tr.translation));
-                }
-            }
-        }
-
-        if part_candidates.is_empty() {
-            warn!("Structure Root has no children other than the graph!");
-            continue;
-        }
-
-        // 4. EXTRACT TOPOLOGY FROM MESH
-        let Ok(mesh_handle) = mesh_handles.get(graph_entity) else {
-            continue;
-        };
-        let Some(mesh) = meshes.get(mesh_handle.id()) else {
-            continue;
-        };
-
-        let positions = match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
-            Some(VertexAttributeValues::Float32x3(p)) => p,
-            _ => {
-                warn!("Graph has no positions");
-                continue;
-            }
-        };
-        let colors: Option<&Vec<[f32; 4]>> = match mesh.attribute(Mesh::ATTRIBUTE_COLOR) {
-            Some(VertexAttributeValues::Float32x4(c)) => Some(c),
-            _ => None,
-        };
-
-        // Get Graph's Local Transform to convert Vertices -> Wrapper Space
-        let graph_local_tr = transforms.get(graph_entity).unwrap_or(&Transform::IDENTITY);
-
-        // 5. MATCH NODES
-        let mut nodes = Vec::with_capacity(positions.len());
-        let mut node_to_entity = Vec::with_capacity(positions.len());
-
-        info!(
-            "Matching {} nodes against {} candidates...",
-            positions.len(),
-            part_candidates.len()
-        );
-
-        for (i, local_pos) in positions.iter().enumerate() {
-            // Transform Vertex: Graph Space -> Wrapper Space
-            let vertex_wrapper_space = graph_local_tr.transform_point(Vec3::from(*local_pos));
-
-            let is_fixed = if let Some(c) = colors {
-                c[i][0] > 0.5
-            } else {
-                false
-            };
-
-            let mut matched_entity = Entity::PLACEHOLDER;
-            let mut best_dist_sq = 0.1 * 0.1; // 10cm tolerance
-
-            for (part_entity, part_pos) in &part_candidates {
-                let d2 = part_pos.distance_squared(vertex_wrapper_space);
-                if d2 < best_dist_sq {
-                    best_dist_sq = d2;
-                    matched_entity = *part_entity;
-                }
-            }
-
-            if matched_entity != Entity::PLACEHOLDER {
-                // Attach SimPart to the Visual Part
-                commands.entity(matched_entity).insert((
-                    SimPart {
-                        root_entity: wrapper_entity,
-                        node_index: i,
-                    },
-                    CollisionEventsEnabled, // Ensure Avian reports hits on this part
-                ));
-            } else {
-                warn!(
-                    "Node {} FAIL. WrapperSpace Pos: {:?}",
-                    i, vertex_wrapper_space
-                );
-            }
-
-            nodes.push(PhysNode {
-                fixed: is_fixed,
-                pos: vertex_wrapper_space.as_dvec3(), // Solver runs in Wrapper Local Space
-                vel: DVec3::ZERO,
-                rot: DQuat::IDENTITY,
-                ang_vel: DVec3::ZERO,
-            });
-            node_to_entity.push(matched_entity);
-        }
-
-        // 6. BUILD CONNECTIONS
-        let mut connections = Vec::new();
-        if let Some(indices) = mesh.indices() {
-            let indices_iter: Box<dyn Iterator<Item = usize>> = match indices {
-                Indices::U16(vec) => Box::new(vec.iter().map(|&i| i as usize)),
-                Indices::U32(vec) => Box::new(vec.iter().map(|&i| i as usize)),
-            };
-            let idx_vec: Vec<usize> = indices_iter.collect();
-            for edge in idx_vec.chunks_exact(2) {
-                let a = edge[0];
-                let b = edge[1];
-                let diff = nodes[b].pos - nodes[a].pos;
-                let len = diff.length();
-                let dir = if len > 1e-6 { diff / len } else { DVec3::Y };
-
-                connections.push(Connection {
-                    alive: true,
-                    node_a: a,
-                    node_b: b,
-                    rest_len: len,
-                    rest_local_rot: DQuat::IDENTITY,
-                    local_axis: dir,
-                    material: CONCRETE,
-                    baseline_impulse: 0.,
-                    last_stress_ratio: 0.,
-                });
-            }
-        }
-
-        // 7. INITIALIZE SIMULATION ON WRAPPER
-        let mut system = StructuralSim {
-            nodes,
-            connections,
-            island: None,
-            frame_count: 0,
-            node_to_entity,
-        };
-        system.create_island();
-
-        commands.entity(wrapper_entity).insert((
-            system,
-            RigidBody::Kinematic, // The Wrapper acts as the monolithic body
-                                  // Note: Transform/GlobalTransform already exist on the GLTF node
-        ));
-
-        // Hide the graph
-        commands.entity(graph_entity).insert(Visibility::Hidden);
+    // NOTE: If list_b is already sorted, shuffle it before this loop
+    // to avoid O(N) worst case.
+    for (i, vec) in list_b.iter().enumerate() {
+        tree.add(&vec.to_array(), i as u64);
     }
+
+    // 2. Query
+    let mut pairings = Vec::with_capacity(list_a.len());
+    for (i, vec_a) in list_a.iter().enumerate() {
+        let neighbor = tree.nearest_one::<SquaredEuclidean>(&vec_a.to_array());
+        // neighbor.item is the index we stored in .add()
+        pairings.push((i, neighbor.item as usize));
+    }
+    pairings
 }
 
 // =========================================================================
@@ -752,11 +649,10 @@ fn extract_system_subset(
 // =========================================================================
 
 fn solve_system(mut sims: Query<&mut StructuralSim>) {
-    // Parallelize if possible: sims.par_iter_mut()
     sims.par_iter_mut().for_each(|mut sim| {
         sim.solve_for_x();
         sim.check_breakage();
-        if sim.island.as_ref().unwrap().needs_refactor {
+        if sim.island.as_ref().map_or(false, |i| i.needs_refactor) {
             sim.update_stiffness_matrix();
         }
     });
@@ -838,17 +734,59 @@ fn handle_input_force(
     gizmos.sphere(center_f32, 0.1, Color::WHITE);
 
     if mouse.just_pressed(MouseButton::Left) {
-        let impulse = 500_000.0;
+        let impulse = 1_000.0;
         for mut sim in sims.iter_mut() {
             for n in &mut sim.nodes {
                 let diff = n.pos - center;
                 let dist = diff.length();
-                if dist < 10.0 {
+                if dist < 20.0 {
                     let force = diff.normalize() * (impulse / dist.max(1.0));
                     // Apply as velocity change
                     n.vel += force * DT;
                 }
             }
+        }
+    }
+}
+
+#[derive(Component)]
+struct DestructionTimer(Timer);
+
+fn shoot_ball(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    keypresses: Res<ButtonInput<KeyCode>>,
+    camera_query: Single<&GlobalTransform, With<CameraController>>,
+) {
+    if keypresses.just_pressed(KeyCode::KeyB) {
+        let cam_transform = *camera_query;
+        let shoot_vector = cam_transform.forward();
+        let ball_spawn_p = cam_transform.translation();
+        let ball_spawn_transform = Transform::from_translation(ball_spawn_p);
+        commands.spawn((
+            RigidBody::Dynamic,
+            Collider::sphere(0.5),
+            ColliderDensity(8.0),
+            CollisionEventsEnabled,
+            Mesh3d(meshes.add(Sphere::new(0.5))),
+            MeshMaterial3d(materials.add(StandardMaterial::from_color(Color::srgb(0.3, 0.4, 0.9)))),
+            ball_spawn_transform.clone(),
+            LinearVelocity(shoot_vector * 30.0),
+            DestructionTimer(Timer::new(Duration::from_secs_f32(10.0), TimerMode::Once)),
+        ));
+    }
+}
+
+fn handle_ball_despawning(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut ball_destruction_timers_query: Query<(Entity, &mut DestructionTimer)>,
+) {
+    for (entity, mut timer) in &mut ball_destruction_timers_query {
+        timer.0.tick(time.delta());
+        if timer.0.is_finished() {
+            commands.entity(entity).despawn();
         }
     }
 }
