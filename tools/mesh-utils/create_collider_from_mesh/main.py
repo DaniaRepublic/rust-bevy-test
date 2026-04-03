@@ -19,7 +19,7 @@ mesh = coacd.Mesh(vertices=mesh.vertices, indices=mesh.faces)
 parts = coacd.run_coacd(
     mesh,
     # 1. Force a maximum number of hulls (Set to your target: 13)
-    max_convex_hull=13,
+    max_convex_hull=20,
     # 2. Increase threshold to allow "uglier" merges (Default is 0.05).
     #    Try 0.1 or 0.15 if 13 hulls look too distorted.
     threshold=0.1,

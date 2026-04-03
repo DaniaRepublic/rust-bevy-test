@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.17.3", features = ["bevy_remote", "jpeg"] }
-avian3d = "0.4.1"
-bevy-inspector-egui = "0.35.0"
+bevy = { version = "0.18.0", features = ["bevy_remote", "jpeg", "bevy_debug_stepping"] }
+avian3d = "0.5.0"
+bevy-inspector-egui = "0.36.0"
 bevy_rerecast = "0.3.0"
 avian_rerecast = "0.3.0"
 vleue_navigator = { version = "0.14.0", features = ["avian3d"] }

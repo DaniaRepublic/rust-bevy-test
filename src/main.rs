@@ -31,6 +31,9 @@ use camera_controller::*;
 mod sourcelike_kinematic_controller;
 use sourcelike_kinematic_controller::*;
 
+mod helpers;
+use helpers::*;
+
 /// NavmeshUpdaterPlugin obstacle (add to collider to be used by plugin in navmesh construction)
 //#[derive(Component)]
 //struct Obstacle;
@@ -1077,17 +1080,6 @@ fn place_display_object(
             message_writer.write(NavmeshRegeneration);
         }
     }
-}
-
-#[inline]
-fn is_descendant_of(
-    parent: Entity,
-    maybe_descendant: Entity,
-    hierarchy_query: Query<&ChildOf>,
-) -> bool {
-    hierarchy_query
-        .iter_ancestors(maybe_descendant)
-        .any(|a| a == parent)
 }
 
 fn add_colliders_to_new_meshes(

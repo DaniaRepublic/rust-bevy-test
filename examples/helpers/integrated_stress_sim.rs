@@ -30,7 +30,7 @@ pub const ANG_DAMPING: f64 = 0.998;
 pub const INTERNAL_LIN_DAMPING: f64 = 1000.0;
 pub const INTERNAL_ROT_DAMPING: f64 = 300.0;
 
-pub const GRAVITY: DVec3 = DVec3::new(0.0, -9.81, 0.0);
+pub const GRAVITY: DVec3 = DVec3::new(0.0, 0.0, 0.0);
 
 // MASS
 pub const NODE_MASS: f64 = 500.0;
@@ -74,7 +74,7 @@ pub const CONCRETE: MaterialProps = MaterialProps {
 #[derive(Clone)]
 pub struct PhysNode {
     pub fixed: bool,
-    pub pos: DVec3,     // f64
+    pub pos: DVec3,     // f64 (Local Space relative to Root)
     pub vel: DVec3,     // f64
     pub rot: DQuat,     // f64
     pub ang_vel: DVec3, // f64
@@ -116,8 +116,12 @@ pub struct StructuralSim {
     pub frame_count: usize,
     // MAPPING (The Bridge)
     // Index i corresponds to nodes[i].
-    // If Entity::PLACEHOLDER, this node has no visual representation (pure structural node).
     pub node_to_entity: Vec<Entity>,
+
+    // PHYSICS MODE
+    // If false (Static): We apply manual gravity to nodes (Visual Sag).
+    // If true (Dynamic): We DO NOT apply gravity. Avian handles the Root's fall.
+    pub is_dynamic: bool,
 }
 
 /// The "Handle".
@@ -128,6 +132,11 @@ pub struct SimPart {
     pub root_entity: Entity,
     pub node_index: usize,
 }
+
+/// This is just a marker component for the visual entity (usually parent of collider) for ease of
+/// navigation purposes.
+#[derive(Component)]
+pub struct VisualSimPart;
 
 // =========================================================================
 // PHYSICS IMPLEMENTATION (f64)
@@ -141,6 +150,7 @@ impl StructuralSim {
             island: None,
             frame_count: 0,
             node_to_entity: Vec::new(),
+            is_dynamic: false, // Default to Anchored/Static
         }
     }
 
@@ -152,6 +162,7 @@ impl StructuralSim {
         vel: Vec3,
         rot: Quat,
         ang_vel: Vec3,
+        entity: Entity,
     ) -> usize {
         self.nodes.push(PhysNode {
             fixed,
@@ -160,6 +171,7 @@ impl StructuralSim {
             rot: rot.as_dquat(),
             ang_vel: ang_vel.as_dvec3(),
         });
+        self.node_to_entity.push(entity);
         self.nodes.len() - 1
     }
 
@@ -292,15 +304,10 @@ impl StructuralSim {
             return;
         };
         let is_calibrating = self.frame_count < CALIBRATION_FRAMES;
-
-        // Tuning: How much of the "Pent up" torque is converted to rotation when snapping?
-        // 0.2 provides a nice tumble without exploding the simulation.
         let breakage_rotation_factor = 0.2;
 
-        // Iterate by index to avoid borrowing `self.connections` while needing `self.nodes`
         for i in 0..self.connections.len() {
-            // 1. EXTRACT CONNECTION DATA (Read-Only Copy)
-            // We copy the primitive data we need to avoid holding a reference to self.connections
+            // 1. COPY PRIMITIVE DATA
             let (
                 node_a_idx,
                 node_b_idx,
@@ -328,7 +335,7 @@ impl StructuralSim {
                 continue;
             }
 
-            // 2. RECOVER FORCES (Read-Only Access to Nodes)
+            // 2. RECOVER FORCES
             let (p_a, v_a, r_a, w_a) = {
                 let n = &self.nodes[node_a_idx];
                 (n.pos, n.vel, n.rot, n.ang_vel)
@@ -338,8 +345,7 @@ impl StructuralSim {
                 (n.pos, n.vel, n.rot, n.ang_vel)
             };
 
-            // -- Linear Force --
-            // Target position of B relative to A based on A's rotation
+            // Linear Force
             let target_offset_world = r_a * local_axis * rest_len;
             let target_pos_b = p_a + target_offset_world;
             let pos_error = target_pos_b - p_b;
@@ -347,9 +353,9 @@ impl StructuralSim {
             let force_elastic = pos_error * JOINT_LIN_STIFFNESS;
             let rel_vel = v_b - v_a;
             let force_viscous = rel_vel * -INTERNAL_LIN_DAMPING;
-            let fl = (force_elastic + force_viscous) * DT; // Linear Impulse
+            let fl = (force_elastic + force_viscous) * DT;
 
-            // -- Angular Force --
+            // Angular Force
             let q_rel = r_a.inverse() * r_b;
             let q_err = q_rel * rest_local_rot.inverse();
             let (_, angle_sin) = q_err.to_axis_angle();
@@ -359,11 +365,7 @@ impl StructuralSim {
             let torque_viscous = rel_w.length() * INTERNAL_ROT_DAMPING;
             let fa_mag = (torque_elastic + torque_viscous) * DT;
 
-            // 3. DECOMPOSE STRESS
-            // [SUGGESTED CHANGE]: Use the Socket Orientation (Node A) as the reference frame.
-            // In a Decoupled Solver, the "Beam" is defined by the parent's rotation.
-            // If we used (p_b - p_a), a beam hanging 90 deg down would register as Tension.
-            // Using (r_a * axis) registers it as Shear (correct for Cantilever logic).
+            // 3. DECOMPOSE STRESS (Using Socket Orientation for Frame)
             let dir = (r_a * local_axis).normalize();
 
             let normal_force = fl.dot(dir);
@@ -375,65 +377,37 @@ impl StructuralSim {
                 normal_force.abs() * mat.compression_mult
             };
 
-            // Reject the normal component to get pure shear vector
             let shear_vec = fl - (dir * normal_force);
             let shear_mag = shear_vec.length();
             let term_shear = shear_mag * mat.shear_mult;
 
-            // -- INDUCED BENDING MOMENT --
-            // Logic: Shear Force * Lever Arm = Extra Torque
             let induced_moment = shear_mag * (rest_len * 0.5);
             let term_bending = (fa_mag + induced_moment) * mat.bending_mult;
 
             let total_stress = term_normal + term_shear + term_bending;
 
-            // 4. APPLY RESULTS
+            // 4. APPLY
             if is_calibrating {
-                // During calibration, just raise the baseline
                 self.connections[i].baseline_impulse =
                     total_stress.max(self.connections[i].baseline_impulse);
             } else {
                 let limit = baseline_impulse + mat.strength;
                 let stress_excess = (total_stress - baseline_impulse).max(0.0);
-
-                // Update visualization ratio
                 self.connections[i].last_stress_ratio = (stress_excess / mat.strength) as f32;
 
                 if total_stress > limit {
-                    // BREAK THE BOND
                     self.connections[i].alive = false;
                     island.needs_refactor = true;
 
-                    // [THE FIX]: KINEMATIC COMPENSATION
-                    // If we broke due to Shear/Bending, the solver suppressed the rotation.
-                    // We must manually inject the angular momentum that "should" have existed.
+                    // Kinematic Compensation (Torque Injection)
                     if (term_bending + term_shear) > term_normal {
-                        // Calculate Torque Vector: r x F
-                        // r = Vector from A to center of beam
                         let lever_arm = dir * (rest_len * 0.5);
-
-                        // F = The shear impulse vector calculated above
                         let torque_impulse = lever_arm.cross(shear_vec);
-
-                        // Apply scaled rotation
                         let rot_change = torque_impulse * breakage_rotation_factor;
 
-                        // Apply to A (Reaction: A feels torque as B snaps off)
                         if !self.nodes[node_a_idx].fixed {
                             self.nodes[node_a_idx].ang_vel += rot_change / NODE_MOMENT_OF_INERTIA;
                         }
-
-                        // Apply to B (Action: B tumbles away)
-                        // Opposite direction?
-                        // If B shears DOWN relative to A, `shear_vec` on A (spring force) points UP (pulling A back).
-                        // Therefore `shear_vec` on B points DOWN.
-                        // The `shear_vec` variable above was derived from `fl`.
-                        // `fl` = Force on A from B. (Spring pulls A towards B).
-                        // So `shear_vec` is the force on A.
-                        // Torque on A = r x F_on_A.
-
-                        // Torque on B = r x F_on_B = r x (-F_on_A).
-                        // Effectively, B should rotate opposite to A.
                         if !self.nodes[node_b_idx].fixed {
                             self.nodes[node_b_idx].ang_vel -= rot_change / NODE_MOMENT_OF_INERTIA;
                         }
@@ -447,6 +421,7 @@ impl StructuralSim {
         let Some(island) = self.island.as_mut() else {
             return;
         };
+
         self.frame_count += 1;
         if island.sleeping {
             return;
@@ -482,11 +457,21 @@ impl StructuralSim {
             if node.fixed {
                 continue;
             }
+
             node.vel *= LIN_DAMPING;
             node.ang_vel *= ANG_DAMPING;
 
             let offset = i * DOF_PER_NODE;
-            let vel_pred = node.vel + GRAVITY * DT;
+
+            // [CRITICAL CHANGE]: Gravity Logic
+            // If Dynamic: The Root is falling (Avian). Nodes are in freefall relative to Root. No Gravity.
+            // If Static: The Root is fixed. Nodes must feel gravity to sag/break.
+            let mut vel_pred = node.vel;
+
+            if !self.is_dynamic {
+                vel_pred += GRAVITY * DT;
+            }
+
             let m = vel_pred * NODE_MASS;
             let am = node.ang_vel * NODE_MOMENT_OF_INERTIA;
 
@@ -498,21 +483,22 @@ impl StructuralSim {
             island.b[offset + 5] = am.z;
         }
 
-        // 2. RESTORING FORCES (Standard Implicit Spring)
+        // 2. RESTORING FORCES
         for conn in self.connections.iter() {
             if !conn.alive {
                 continue;
             }
+
             let p_a = self.nodes[conn.node_a].pos;
             let p_b = self.nodes[conn.node_b].pos;
             let q_a = self.nodes[conn.node_a].rot;
 
-            // A. Linear
+            // Linear
             let target = p_a + q_a * conn.local_axis * conn.rest_len;
             let pos_error = target - p_b;
             let spring_impulse = pos_error * (JOINT_LIN_STIFFNESS * DT);
 
-            // B. Angular
+            // Angular
             let q_b = self.nodes[conn.node_b].rot;
             let q_err = (q_a.inverse() * q_b) * conn.rest_local_rot.inverse();
             let (axis, sin_a) = q_err.to_axis_angle();
@@ -526,7 +512,6 @@ impl StructuralSim {
             let ia = conn.node_a * 6;
             let ib = conn.node_b * 6;
 
-            // Apply Linear
             island.b[ib + 0] += spring_impulse.x;
             island.b[ib + 1] += spring_impulse.y;
             island.b[ib + 2] += spring_impulse.z;
@@ -534,7 +519,6 @@ impl StructuralSim {
             island.b[ia + 1] -= spring_impulse.y;
             island.b[ia + 2] -= spring_impulse.z;
 
-            // Apply Angular
             island.b[ib + 3] += ang_impulse.x;
             island.b[ib + 4] += ang_impulse.y;
             island.b[ib + 5] += ang_impulse.z;
@@ -553,7 +537,6 @@ impl StructuralSim {
             let mut v = DVec3::new(x[o], x[o + 1], x[o + 2]);
             let mut av = DVec3::new(x[o + 3], x[o + 4], x[o + 5]);
 
-            // f64 Caps
             let max_v = 200.0;
             if v.length_squared() > max_v * max_v {
                 v = v.normalize() * max_v;
